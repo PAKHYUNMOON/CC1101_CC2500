@@ -24,16 +24,23 @@ extern "C" {
 #define PROTO_DEVICE_ID_LEN          4U     /* 4-byte unique device ID */
 #define PROTO_BROADCAST_ID           {0xFF, 0xFF, 0xFF, 0xFF}
 
-/* ---------- packet structure ----------
- * All packets on both radios share this envelope:
+/* ---------- packet / air frame (application PDU) ----------
+ *
+ * CC1101 (MICS data) and CC2500 messages built with Proto_BuildPacket() use:
  *
  * Byte 0       : CMD  (command / message type)
  * Byte 1       : SEQ  (sequence number, wraps at 255)
  * Byte 2..5    : DEVICE_ID[4]  (target or source)
  * Byte 6..N    : PAYLOAD (command-specific, 0..55 bytes)
  *
- * CRC is handled by the radio hardware (PKTCTRL0.CRC_EN).
- * Length byte is prepended automatically by the driver.
+ * On-air (both radios): [LEN] + [bytes above] + [HW CRC] (+ CC1101 append status).
+ * LEN/CRC are added by the driver / chip (PKTCTRL0.CRC_EN); use Proto_ParsePacket()
+ * only for buffers that contain the full 6-byte header above.
+ *
+ * Exception — CC2500 Master wake-up beacon only (short body, save air time):
+ *   Payload body is [CMD_WAKEUP_BEACON][DEVICE_ID x 4] — no SEQ in this path.
+ *   Implemented in CC2500_SendWakeUpBeacon(); Slave validates in Slave_HandleWakeUp().
+ * CC2500 WAKEUP_ACK (Slave->Master) uses the full header via Proto_BuildPacket().
  * ------------------------------------------------------ */
 #define PROTO_HDR_SIZE               6U     /* CMD + SEQ + ID[4] */
 #define PROTO_MAX_PAYLOAD            (61U - PROTO_HDR_SIZE)
