@@ -449,6 +449,116 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
     return CC2500_OK;
 }
 
+CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
+{
+    /*
+     * Wake-up optimized profile for CC2500 (2.4 GHz)
+     * - Lower data rate (~2.4 kbps) for better sensitivity in WOR mode
+     * - Wider RX BW for frequency tolerance
+     * - WOR enabled with ~500 ms sniff interval
+     * - GDO0 asserts on packet received with CRC OK -> wakes MCU via EXTI
+     */
+    static const struct {
+        uint8_t reg;
+        uint8_t val;
+    } cfg[] = {
+        /* GDO: GDO0 = CRC OK (used as EXTI wake-up source) */
+        { CC2500_IOCFG2,   0x2E }, /* high impedance */
+        { CC2500_IOCFG1,   0x2E }, /* high impedance */
+        { CC2500_IOCFG0,   0x07 }, /* asserts on CRC OK */
+
+        /* FIFO / packet */
+        { CC2500_FIFOTHR,  0x47 },
+        { CC2500_SYNC1,    0xBE }, /* distinct sync word for wake-up */
+        { CC2500_SYNC0,    0xEF },
+        { CC2500_PKTLEN,   0x0A }, /* max 10 bytes for wake-up packets */
+        { CC2500_PKTCTRL1, 0x04 }, /* APPEND_STATUS=1 */
+        { CC2500_PKTCTRL0, 0x05 }, /* variable length + CRC */
+        { CC2500_ADDR,     0x00 },
+        { CC2500_CHANNR,   CC2500_WAKEUP_CHANNEL },
+
+        /* Frequency: 2.4 GHz ISM */
+        { CC2500_FSCTRL1,  0x06 },
+        { CC2500_FSCTRL0,  0x00 },
+        { CC2500_FREQ2,    0x5C },
+        { CC2500_FREQ1,    0x6E },
+        { CC2500_FREQ0,    0x5C },
+
+        /* Modem: low data rate ~2.4 kbps for WOR sensitivity */
+        { CC2500_MDMCFG4,  0xF6 }, /* RX BW ~58.04 kHz, DRATE_E=6 */
+        { CC2500_MDMCFG3,  0x83 }, /* DRATE_M=131 -> ~2.4 kbps */
+        { CC2500_MDMCFG2,  0x13 }, /* GFSK, 30/32 sync */
+        { CC2500_MDMCFG1,  0x22 }, /* 4-byte preamble, CHANSPC_E=2 */
+        { CC2500_MDMCFG0,  0xF8 }, /* channel spacing */
+        { CC2500_DEVIATN,  0x15 }, /* ~5.16 kHz deviation */
+
+        /* Main radio control: RX->IDLE after pkt, auto-cal on IDLE->RX/TX */
+        { CC2500_MCSM2,    0x07 },
+        { CC2500_MCSM1,    0x00 }, /* CCA=always, RX/TX->IDLE */
+        { CC2500_MCSM0,    0x18 }, /* auto-calibrate on IDLE->RX/TX */
+
+        /* FS / AGC */
+        { CC2500_FOCCFG,   0x16 },
+        { CC2500_BSCFG,    0x6C },
+        { CC2500_AGCCTRL2, 0x03 },
+        { CC2500_AGCCTRL1, 0x40 },
+        { CC2500_AGCCTRL0, 0x91 },
+
+        /* WOR: ~500 ms sniff interval
+         * EVENT0 = 0x876B, WOR_RES=0 => t_event0 ~ 1.89s @ 26MHz/750
+         * Using WOR_RES=1 (2^5 = 32 periods): EVENT0=0x04E2 => ~487 ms */
+        { CC2500_WOREVT1,  0x04 },
+        { CC2500_WOREVT0,  0xE2 },
+        { CC2500_WORCTRL,  0x79 }, /* WOR_RES=1, EVENT1=7 (48 clk), RC_PD=1 */
+
+        /* Front-end / calibration / test */
+        { CC2500_FREND1,   0x56 },
+        { CC2500_FREND0,   0x10 },
+        { CC2500_FSCAL3,   0xE9 },
+        { CC2500_FSCAL2,   0x2A },
+        { CC2500_FSCAL1,   0x00 },
+        { CC2500_FSCAL0,   0x1F },
+        { CC2500_RCCTRL1,  0x41 },
+        { CC2500_RCCTRL0,  0x00 },
+        { CC2500_FSTEST,   0x59 },
+        { CC2500_PTEST,    0x7F },
+        { CC2500_AGCTEST,  0x3F },
+        { CC2500_TEST2,    0x81 },
+        { CC2500_TEST1,    0x35 },
+        { CC2500_TEST0,    0x09 }
+    };
+
+    uint8_t pa = 0xFE; /* high power for wake-up reliability */
+
+    if (CC2500_Reset(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+
+    for (uint32_t i = 0U; i < (sizeof(cfg) / sizeof(cfg[0])); i++) {
+        if (cc2500_write_reg(dev, cfg[i].reg, cfg[i].val) != CC2500_OK) {
+            return CC2500_ERR_SPI;
+        }
+    }
+
+    if (cc2500_write_burst(dev, CC2500_PATABLE, &pa, 1U) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    if (CC2500_FlushRx(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+    if (CC2500_FlushTx(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+
+    if (cc2500_strobe(dev, CC2500_SCAL, NULL) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+    HAL_Delay(2U);
+
+    return CC2500_OK;
+}
+
 int16_t CC2500_ReadRSSI_dBm(CC2500_HandleTypeDef *dev)
 {
     uint8_t raw = 0U;
@@ -640,4 +750,234 @@ CC2500_Status CC2500_ReadPacket(CC2500_HandleTypeDef *dev,
 
     *len = pkt_len;
     return CC2500_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* power management                                                            */
+/* -------------------------------------------------------------------------- */
+
+CC2500_Status CC2500_EnterSleep(CC2500_HandleTypeDef *dev)
+{
+    if (CC2500_Idle(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+    return cc2500_strobe(dev, CC2500_SPWD, NULL);
+}
+
+CC2500_Status CC2500_WakeFromSleep(CC2500_HandleTypeDef *dev)
+{
+    cc2500_cs_low(dev);
+    cc2500_delay_us(10U);
+    cc2500_cs_high(dev);
+
+    cc2500_delay_us(200U);
+
+    if (cc2500_wait_miso_low(dev, 5000U) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+
+    return cc2500_wait_state(dev, CC2500_MARCSTATE_IDLE, 50U);
+}
+
+/* -------------------------------------------------------------------------- */
+/* WOR (Wake-on-Radio) for Slave implant                                       */
+/* -------------------------------------------------------------------------- */
+
+CC2500_Status CC2500_ConfigureWOR(CC2500_HandleTypeDef *dev,
+                                  uint8_t wor_res,
+                                  uint16_t event0_timeout)
+{
+    if (CC2500_Idle(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+
+    /* Set EVENT0 timeout */
+    if (cc2500_write_reg(dev, CC2500_WOREVT1, (uint8_t)(event0_timeout >> 8U)) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+    if (cc2500_write_reg(dev, CC2500_WOREVT0, (uint8_t)(event0_timeout & 0xFFU)) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    /* WORCTRL: WOR_RES | EVENT1=7 (48 clk) | RC_PD=1 (RC osc off in sleep) */
+    uint8_t worctrl = (uint8_t)((wor_res << 4U) | 0x79U);
+    if (cc2500_write_reg(dev, CC2500_WORCTRL, worctrl) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    return CC2500_OK;
+}
+
+CC2500_Status CC2500_EnterWOR(CC2500_HandleTypeDef *dev)
+{
+    /* Ensure RX->IDLE on pkt, so GDO0 pulse can trigger EXTI before WOR re-sleeps */
+    if (cc2500_write_reg(dev, CC2500_MCSM1, 0x00) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    if (CC2500_FlushRx(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+
+    /* Reset WOR timer and enter WOR mode */
+    if (cc2500_strobe(dev, CC2500_SWORRST, NULL) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+    if (cc2500_strobe(dev, CC2500_SWOR, NULL) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    return CC2500_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Wake-up beacon for Master programmer                                        */
+/* -------------------------------------------------------------------------- */
+
+CC2500_Status CC2500_SendWakeUpBeacon(CC2500_HandleTypeDef *dev,
+                                      const uint8_t *device_id,
+                                      uint8_t id_len,
+                                      uint8_t repeat_count)
+{
+    if ((device_id == NULL) || (id_len == 0U) || (id_len > 8U)) {
+        return CC2500_ERR_PARAM;
+    }
+    if (repeat_count == 0U) {
+        repeat_count = CC2500_WAKEUP_BEACON_REPEAT;
+    }
+
+    if (CC2500_SetChannel(dev, CC2500_WAKEUP_CHANNEL) != CC2500_OK) {
+        return CC2500_ERR_STATE;
+    }
+
+    /*
+     * Send repeated beacons to ensure the Slave's WOR window catches at
+     * least one. Beacon payload: [CMD_WAKEUP(0x01)] [device_id...]
+     */
+    uint8_t beacon[1U + 8U];
+    beacon[0] = 0x01U; /* CMD_WAKEUP */
+    for (uint8_t i = 0U; i < id_len; i++) {
+        beacon[1U + i] = device_id[i];
+    }
+    uint8_t beacon_len = (uint8_t)(1U + id_len);
+
+    for (uint8_t r = 0U; r < repeat_count; r++) {
+        if (CC2500_FlushTx(dev) != CC2500_OK) {
+            return CC2500_ERR_TIMEOUT;
+        }
+
+        uint8_t fifo[1U + CC2500_PKT_MAX_LEN];
+        fifo[0] = beacon_len;
+        for (uint8_t i = 0U; i < beacon_len; i++) {
+            fifo[1U + i] = beacon[i];
+        }
+
+        if (cc2500_write_burst(dev, CC2500_TXFIFO, fifo, (uint8_t)(beacon_len + 1U)) != CC2500_OK) {
+            return CC2500_ERR_SPI;
+        }
+
+        if (cc2500_strobe(dev, CC2500_STX, NULL) != CC2500_OK) {
+            return CC2500_ERR_SPI;
+        }
+
+        /* Wait for TX to complete */
+        if (cc2500_wait_state(dev, CC2500_MARCSTATE_IDLE, 100U) != CC2500_OK) {
+            (void)CC2500_Idle(dev);
+        }
+
+        if (r < (repeat_count - 1U)) {
+            HAL_Delay(CC2500_WAKEUP_BEACON_INTERVAL_MS);
+        }
+    }
+
+    return CC2500_OK;
+}
+
+/* -------------------------------------------------------------------------- */
+/* direct send (no LBT, for wake-up channel)                                   */
+/* -------------------------------------------------------------------------- */
+
+CC2500_Status CC2500_SendPacketDirect(CC2500_HandleTypeDef *dev,
+                                      uint8_t ch,
+                                      const uint8_t *data,
+                                      uint8_t len,
+                                      uint32_t tx_timeout_ms)
+{
+    uint8_t fifo[1U + CC2500_PKT_MAX_LEN];
+
+    if ((data == NULL) || (len == 0U) || (len > CC2500_PKT_MAX_LEN)) {
+        return CC2500_ERR_PARAM;
+    }
+
+    if (CC2500_SetChannel(dev, ch) != CC2500_OK) {
+        return CC2500_ERR_STATE;
+    }
+
+    if (CC2500_FlushTx(dev) != CC2500_OK) {
+        return CC2500_ERR_TIMEOUT;
+    }
+
+    fifo[0] = len;
+    for (uint8_t i = 0U; i < len; i++) {
+        fifo[1U + i] = data[i];
+    }
+
+    if (cc2500_write_burst(dev, CC2500_TXFIFO, fifo, (uint8_t)(len + 1U)) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    if (cc2500_strobe(dev, CC2500_STX, NULL) != CC2500_OK) {
+        return CC2500_ERR_SPI;
+    }
+
+    uint32_t t0 = HAL_GetTick();
+    while ((HAL_GetTick() - t0) < tx_timeout_ms) {
+        uint8_t st = cc2500_get_marcstate(dev);
+        if (st == CC2500_MARCSTATE_IDLE) {
+            return CC2500_OK;
+        }
+        if (st == CC2500_MARCSTATE_TXFIFO_UNDERFLOW) {
+            (void)CC2500_FlushTx(dev);
+            return CC2500_ERR_STATE;
+        }
+    }
+
+    (void)CC2500_Idle(dev);
+    return CC2500_ERR_TIMEOUT;
+}
+
+/* -------------------------------------------------------------------------- */
+/* RX with timeout                                                             */
+/* -------------------------------------------------------------------------- */
+
+CC2500_Status CC2500_WaitAndReadPacket(CC2500_HandleTypeDef *dev,
+                                       uint8_t ch,
+                                       uint8_t *buf,
+                                       uint8_t *len,
+                                       uint8_t max_len,
+                                       uint32_t timeout_ms)
+{
+    if (CC2500_EnterRx(dev, ch) != CC2500_OK) {
+        return CC2500_ERR_STATE;
+    }
+
+    uint32_t t0 = HAL_GetTick();
+
+    while ((HAL_GetTick() - t0) < timeout_ms) {
+        if ((dev->gdo0_port != NULL) &&
+            (HAL_GPIO_ReadPin(dev->gdo0_port, dev->gdo0_pin) == GPIO_PIN_SET)) {
+            return CC2500_ReadPacket(dev, buf, len, max_len);
+        }
+
+        if (dev->gdo0_port == NULL) {
+            uint8_t rxbytes = 0U;
+            (void)cc2500_read_status(dev, CC2500_RXBYTES, &rxbytes);
+            if ((rxbytes & 0x7FU) > 0U) {
+                return CC2500_ReadPacket(dev, buf, len, max_len);
+            }
+        }
+    }
+
+    (void)CC2500_Idle(dev);
+    return CC2500_ERR_TIMEOUT;
 }

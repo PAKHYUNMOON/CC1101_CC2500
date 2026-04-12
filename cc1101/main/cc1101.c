@@ -641,3 +641,144 @@ CC1101_Status CC1101_ReadPacket(CC1101_HandleTypeDef *dev,
     *len = pkt_len;
     return CC1101_OK;
 }
+
+/* -------------------------------------------------------------------------- */
+/* power management                                                            */
+/* -------------------------------------------------------------------------- */
+
+CC1101_Status CC1101_EnterSleep(CC1101_HandleTypeDef *dev)
+{
+    if (CC1101_Idle(dev) != CC1101_OK) {
+        return CC1101_ERR_TIMEOUT;
+    }
+    return cc1101_strobe(dev, CC1101_SPWD, NULL);
+}
+
+CC1101_Status CC1101_WakeFromSleep(CC1101_HandleTypeDef *dev)
+{
+    cc1101_cs_low(dev);
+    cc1101_delay_us(10U);
+    cc1101_cs_high(dev);
+
+    /* Wait for crystal oscillator to stabilize (~150 us typical) */
+    cc1101_delay_us(200U);
+
+    if (cc1101_wait_miso_low(dev, 5000U) != CC1101_OK) {
+        return CC1101_ERR_TIMEOUT;
+    }
+
+    return cc1101_wait_state(dev, CC1101_MARCSTATE_IDLE, 50U);
+}
+
+/* -------------------------------------------------------------------------- */
+/* PA table                                                                    */
+/* -------------------------------------------------------------------------- */
+
+CC1101_Status CC1101_SetPATable(CC1101_HandleTypeDef *dev,
+                                const uint8_t *pa_table,
+                                uint8_t len)
+{
+    if ((pa_table == NULL) || (len == 0U) || (len > 8U)) {
+        return CC1101_ERR_PARAM;
+    }
+
+    if (CC1101_Idle(dev) != CC1101_OK) {
+        return CC1101_ERR_TIMEOUT;
+    }
+
+    return cc1101_write_burst(dev, CC1101_PATABLE, pa_table, len);
+}
+
+/* -------------------------------------------------------------------------- */
+/* LBT with channel agility & random back-off (Master only)                    */
+/* -------------------------------------------------------------------------- */
+
+static uint32_t cc1101_pseudo_random(uint32_t seed)
+{
+    /* Simple LFSR-based PRNG for back-off jitter */
+    seed ^= seed << 13U;
+    seed ^= seed >> 17U;
+    seed ^= seed << 5U;
+    return seed;
+}
+
+CC1101_Status CC1101_SendPacketLBT_Agile(CC1101_HandleTypeDef *dev,
+                                         const uint8_t *data,
+                                         uint8_t len,
+                                         int16_t cca_threshold_dBm,
+                                         uint32_t listen_ms,
+                                         uint32_t tx_timeout_ms,
+                                         uint8_t max_retries,
+                                         uint8_t *used_channel)
+{
+    uint32_t rng_state = HAL_GetTick();
+
+    if ((data == NULL) || (len == 0U) || (len > CC1101_PKT_MAX_LEN)) {
+        return CC1101_ERR_PARAM;
+    }
+
+    for (uint8_t attempt = 0U; attempt < max_retries; attempt++) {
+        /* Try to find a free channel across all MICS channels */
+        int8_t ch = CC1101_FindFreeChannel(dev, cca_threshold_dBm, listen_ms);
+
+        if (ch >= 0) {
+            CC1101_Status st = CC1101_SendPacketLBT(dev,
+                                                    (uint8_t)ch,
+                                                    data, len,
+                                                    cca_threshold_dBm,
+                                                    listen_ms,
+                                                    tx_timeout_ms);
+            if (st == CC1101_OK) {
+                if (used_channel != NULL) {
+                    *used_channel = (uint8_t)ch;
+                }
+                return CC1101_OK;
+            }
+        }
+
+        /* Random back-off before retry */
+        rng_state = cc1101_pseudo_random(rng_state);
+        uint32_t backoff_ms = (rng_state % CC1101_MICS_MAX_BACKOFF_MS) + 1U;
+        HAL_Delay(backoff_ms);
+    }
+
+    return CC1101_ERR_CCA;
+}
+
+/* -------------------------------------------------------------------------- */
+/* RX with timeout                                                             */
+/* -------------------------------------------------------------------------- */
+
+CC1101_Status CC1101_WaitAndReadPacket(CC1101_HandleTypeDef *dev,
+                                       uint8_t ch,
+                                       uint8_t *buf,
+                                       uint8_t *len,
+                                       uint8_t max_len,
+                                       uint32_t timeout_ms)
+{
+    if (CC1101_EnterRx(dev, ch) != CC1101_OK) {
+        return CC1101_ERR_STATE;
+    }
+
+    uint32_t t0 = HAL_GetTick();
+
+    while ((HAL_GetTick() - t0) < timeout_ms) {
+        /* Check GDO0 for packet received (IOCFG0 = 0x07: CRC OK) */
+        if ((dev->gdo0_port != NULL) &&
+            (HAL_GPIO_ReadPin(dev->gdo0_port, dev->gdo0_pin) == GPIO_PIN_SET)) {
+            return CC1101_ReadPacket(dev, buf, len, max_len);
+        }
+
+        /* Fallback: check RXBYTES if GDO0 not wired */
+        if (dev->gdo0_port == NULL) {
+            uint8_t rxbytes = 0U;
+            (void)cc1101_read_status(dev, CC1101_RXBYTES, &rxbytes);
+            if ((rxbytes & 0x7FU) > 0U) {
+                return CC1101_ReadPacket(dev, buf, len, max_len);
+            }
+        }
+    }
+
+    (void)CC1101_Idle(dev);
+    return CC1101_ERR_TIMEOUT;
+}
