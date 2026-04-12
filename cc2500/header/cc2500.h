@@ -128,12 +128,23 @@ typedef struct
 #define CC2500_MARCSTATE_RXFIFO_OVERFLOW   0x11
 #define CC2500_MARCSTATE_TXFIFO_UNDERFLOW  0x16
 
+/* ---------- WOR configuration ---------- */
+#define CC2500_WOR_RES_1_PERIOD            0x00   /* t_Event0 resolution: 1 period */
+#define CC2500_WOR_RES_32_PERIODS          0x01   /* 2^5 periods */
+#define CC2500_WOR_RES_1024_PERIODS        0x02   /* 2^10 periods */
+#define CC2500_WOR_RES_32768_PERIODS       0x03   /* 2^15 periods */
+
+#define CC2500_WAKEUP_CHANNEL              0U     /* fixed channel for wake-up */
+#define CC2500_WAKEUP_BEACON_REPEAT        10U    /* number of beacon repetitions */
+#define CC2500_WAKEUP_BEACON_INTERVAL_MS   15U    /* interval between beacons */
+
 /* ---------- API ---------- */
 void CC2500_DWT_DelayInit(void);
 void CC2500_SetRSSIOffset(int16_t offset_db);
 
 CC2500_Status CC2500_Reset(CC2500_HandleTypeDef *dev);
 CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev);
+CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev);
 
 CC2500_Status CC2500_Idle(CC2500_HandleTypeDef *dev);
 CC2500_Status CC2500_FlushRx(CC2500_HandleTypeDef *dev);
@@ -163,6 +174,36 @@ CC2500_Status CC2500_ReadPacket(CC2500_HandleTypeDef *dev,
                                 uint8_t *buf,
                                 uint8_t *len,
                                 uint8_t max_len);
+
+/* ---------- power management ---------- */
+CC2500_Status CC2500_EnterSleep(CC2500_HandleTypeDef *dev);
+CC2500_Status CC2500_WakeFromSleep(CC2500_HandleTypeDef *dev);
+
+/* ---------- WOR (Wake-on-Radio) for Slave ---------- */
+CC2500_Status CC2500_EnterWOR(CC2500_HandleTypeDef *dev);
+CC2500_Status CC2500_ConfigureWOR(CC2500_HandleTypeDef *dev,
+                                  uint8_t wor_res,
+                                  uint16_t event0_timeout);
+
+/* ---------- Wake-up beacon for Master ---------- */
+CC2500_Status CC2500_SendWakeUpBeacon(CC2500_HandleTypeDef *dev,
+                                      const uint8_t *device_id,
+                                      uint8_t id_len,
+                                      uint8_t repeat_count);
+
+/* ---------- send / receive (no LBT, wake-up channel) ---------- */
+CC2500_Status CC2500_SendPacketDirect(CC2500_HandleTypeDef *dev,
+                                      uint8_t ch,
+                                      const uint8_t *data,
+                                      uint8_t len,
+                                      uint32_t tx_timeout_ms);
+
+CC2500_Status CC2500_WaitAndReadPacket(CC2500_HandleTypeDef *dev,
+                                       uint8_t ch,
+                                       uint8_t *buf,
+                                       uint8_t *len,
+                                       uint8_t max_len,
+                                       uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }

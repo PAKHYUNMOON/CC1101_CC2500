@@ -128,6 +128,15 @@ typedef struct
 #define CC1101_MARCSTATE_RXFIFO_OVERFLOW   0x11
 #define CC1101_MARCSTATE_TXFIFO_UNDERFLOW  0x16
 
+/* ---------- MICS channel plan ---------- */
+#define CC1101_MICS_NUM_CHANNELS           10U
+#define CC1101_MICS_BASE_FREQ_KHZ          402150U
+#define CC1101_MICS_CHAN_SPACING_KHZ        300U
+#define CC1101_MICS_LBT_THRESHOLD_DBM      (-80)
+#define CC1101_MICS_LBT_LISTEN_MS          5U
+#define CC1101_MICS_MAX_BACKOFF_MS         50U
+#define CC1101_MICS_MAX_LBT_RETRIES        8U
+
 /* ---------- API ---------- */
 void CC1101_DWT_DelayInit(void);
 void CC1101_SetRSSIOffset(int16_t offset_db);
@@ -163,6 +172,33 @@ CC1101_Status CC1101_ReadPacket(CC1101_HandleTypeDef *dev,
                                 uint8_t *buf,
                                 uint8_t *len,
                                 uint8_t max_len);
+
+/* ---------- power management ---------- */
+CC1101_Status CC1101_EnterSleep(CC1101_HandleTypeDef *dev);
+CC1101_Status CC1101_WakeFromSleep(CC1101_HandleTypeDef *dev);
+
+/* ---------- PA table ---------- */
+CC1101_Status CC1101_SetPATable(CC1101_HandleTypeDef *dev,
+                                const uint8_t *pa_table,
+                                uint8_t len);
+
+/* ---------- LBT with channel agility & random back-off ---------- */
+CC1101_Status CC1101_SendPacketLBT_Agile(CC1101_HandleTypeDef *dev,
+                                         const uint8_t *data,
+                                         uint8_t len,
+                                         int16_t cca_threshold_dBm,
+                                         uint32_t listen_ms,
+                                         uint32_t tx_timeout_ms,
+                                         uint8_t max_retries,
+                                         uint8_t *used_channel);
+
+/* ---------- RX with timeout ---------- */
+CC1101_Status CC1101_WaitAndReadPacket(CC1101_HandleTypeDef *dev,
+                                       uint8_t ch,
+                                       uint8_t *buf,
+                                       uint8_t *len,
+                                       uint8_t max_len,
+                                       uint32_t timeout_ms);
 
 #ifdef __cplusplus
 }
