@@ -55,6 +55,10 @@ void LP_Init(LP_HandleTypeDef *hlp)
 
 LP_WakeupSource LP_EnterStop2(LP_HandleTypeDef *hlp)
 {
+    if (hlp == NULL) {
+        return 0U;
+    }
+
     /* Suspend SPI peripherals to reduce leakage */
     LP_SPI_Suspend(hlp);
 
@@ -85,7 +89,8 @@ LP_WakeupSource LP_EnterStop2(LP_HandleTypeDef *hlp)
         __HAL_GPIO_EXTI_CLEAR_IT(hlp->gdo0_pin);
     }
 
-    if (__HAL_RTC_WAKEUPTIMER_GET_FLAG(hlp->hrtc, RTC_FLAG_WUTF) != 0U) {
+    if ((hlp->hrtc != NULL) &&
+        (__HAL_RTC_WAKEUPTIMER_GET_FLAG(hlp->hrtc, RTC_FLAG_WUTF) != 0U)) {
         src |= LP_WAKEUP_RTC_ALARM;
         __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(hlp->hrtc, RTC_FLAG_WUTF);
     }
