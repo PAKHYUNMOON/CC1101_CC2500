@@ -835,11 +835,17 @@ CC2500_Status CC2500_EnterWOR(CC2500_HandleTypeDef *dev)
 /* -------------------------------------------------------------------------- */
 
 CC2500_Status CC2500_SendWakeUpBeacon(CC2500_HandleTypeDef *dev,
-                                      const uint8_t *device_id,
-                                      uint8_t id_len,
+                                      const uint8_t *pkt,
+                                      uint8_t pkt_len,
                                       uint8_t repeat_count)
 {
-    if ((device_id == NULL) || (id_len == 0U) || (id_len > 8U)) {
+    /*
+     * Repeatedly transmit the caller-supplied MAC PDU on the wake-up
+     * channel. The PDU itself is built by the application layer using
+     * Proto_BuildPacket()+Proto_BuildBeaconPayload() from protocol.h.
+     * This keeps the radio driver free of protocol knowledge.
+     */
+    if ((pkt == NULL) || (pkt_len == 0U) || (pkt_len > CC2500_PKT_MAX_LEN)) {
         return CC2500_ERR_PARAM;
     }
     if (repeat_count == 0U) {
@@ -850,29 +856,19 @@ CC2500_Status CC2500_SendWakeUpBeacon(CC2500_HandleTypeDef *dev,
         return CC2500_ERR_STATE;
     }
 
-    /*
-     * Send repeated beacons to ensure the Slave's WOR window catches at
-     * least one. Beacon payload: [CMD_WAKEUP(0x01)] [device_id...]
-     */
-    uint8_t beacon[1U + 8U];
-    beacon[0] = 0x01U; /* CMD_WAKEUP */
-    for (uint8_t i = 0U; i < id_len; i++) {
-        beacon[1U + i] = device_id[i];
-    }
-    uint8_t beacon_len = (uint8_t)(1U + id_len);
-
     for (uint8_t r = 0U; r < repeat_count; r++) {
         if (CC2500_FlushTx(dev) != CC2500_OK) {
             return CC2500_ERR_TIMEOUT;
         }
 
         uint8_t fifo[1U + CC2500_PKT_MAX_LEN];
-        fifo[0] = beacon_len;
-        for (uint8_t i = 0U; i < beacon_len; i++) {
-            fifo[1U + i] = beacon[i];
+        fifo[0] = pkt_len;
+        for (uint8_t i = 0U; i < pkt_len; i++) {
+            fifo[1U + i] = pkt[i];
         }
 
-        if (cc2500_write_burst(dev, CC2500_TXFIFO, fifo, (uint8_t)(beacon_len + 1U)) != CC2500_OK) {
+        if (cc2500_write_burst(dev, CC2500_TXFIFO, fifo,
+                               (uint8_t)(pkt_len + 1U)) != CC2500_OK) {
             return CC2500_ERR_SPI;
         }
 

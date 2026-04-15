@@ -185,10 +185,15 @@ CC2500_Status CC2500_ConfigureWOR(CC2500_HandleTypeDef *dev,
                                   uint8_t wor_res,
                                   uint16_t event0_timeout);
 
-/* ---------- Wake-up beacon for Master ---------- */
+/* ---------- Wake-up beacon for Master ----------
+ * Sends `repeat_count` copies of the pre-built MAC PDU on the wake-up
+ * channel with CC2500_WAKEUP_BEACON_INTERVAL_MS spacing.
+ * The PDU content (FCF|SEQ|SESS|PAYLOAD) is built by the caller using
+ * Proto_BuildPacket() + Proto_BuildBeaconPayload() from protocol.h.
+ */
 CC2500_Status CC2500_SendWakeUpBeacon(CC2500_HandleTypeDef *dev,
-                                      const uint8_t *device_id,
-                                      uint8_t id_len,
+                                      const uint8_t *pkt,
+                                      uint8_t pkt_len,
                                       uint8_t repeat_count);
 
 /* ---------- send / receive (no LBT, wake-up channel) ---------- */

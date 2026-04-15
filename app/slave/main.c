@@ -9,10 +9,11 @@
  *
  * Communication flow (Slave never initiates):
  *   1. CC2500 WOR detects wake-up beacon -> GDO0 EXTI -> MCU wakes
- *   2. CC2500 sends wake-up ACK to Master
- *   3. CC1101 enters RX on all MICS channels (waits for Master poll)
- *   4. CC1101 responds to Master commands (POLL/WRITE/SLEEP)
- *   5. CC1101 powers down, CC2500 re-enters WOR, MCU -> Stop 2
+ *   2. Parse beacon, remember SESS assigned by Master
+ *   3. CC2500 sends wake-up ACK echoing DEVICE_ID+SESS
+ *   4. CC1101 enters RX on all MICS channels (waits for Master poll)
+ *   5. CC1101 responds to Master commands filtered by SESS
+ *   6. CC1101 powers down, CC2500 re-enters WOR, MCU -> Stop 2
  *
  * MCU: STM32U575 Q-series
  * Radios: CC2500 (2.4 GHz WOR wake-up), CC1101 (400 MHz MICS data)
@@ -40,6 +41,7 @@ static const uint8_t g_my_id[PROTO_DEVICE_ID_LEN] = {0x00, 0x00, 0x00, 0x01};
 /* ---------- session state ---------- */
 static volatile bool g_wakeup_flag = false;
 static uint8_t g_seq = 0U;
+static uint8_t g_session_id = PROTO_SESS_UNASSIGNED; /* assigned by Master wake-up */
 
 /* ---------- simulated sensor data ---------- */
 static uint8_t g_sensor_data[16] = {
@@ -55,7 +57,7 @@ static void Slave_EnterDeepSleep(void);
 static int  Slave_HandleWakeUp(void);
 static int  Slave_HandleMICSSession(void);
 static int  Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp);
-static void Slave_SendResponse(const Proto_Packet *resp);
+static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel);
 
 /* ========================================================================== */
 /* EXTI callback - CC2500 GDO0 wake-up interrupt                              */
@@ -154,57 +156,77 @@ static int Slave_HandleWakeUp(void)
 {
     uint8_t rx_buf[CC2500_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
-    Proto_Packet beacon_pkt;
 
-    /* Read the received beacon packet from CC2500 */
+    /* 1) Read the received beacon packet from CC2500 */
     CC2500_Status st = CC2500_ReadPacket(&g_cc2500, rx_buf, &rx_len, sizeof(rx_buf));
     if (st != CC2500_OK) {
-        /* GDO0 fired but no valid packet - might be noise */
         return -1;
     }
 
-    /* Parse beacon: expect CMD_WAKEUP with our device ID */
-    if (rx_len < 2U) {
+    /* 2) Parse MAC PDU */
+    Proto_Packet beacon;
+    if (Proto_ParsePacket(rx_buf, rx_len, &beacon) < 0) {
         return -2;
     }
 
-    /* Wake-up beacon format: [CMD_WAKEUP(0x01)] [device_id...] */
-    if (rx_buf[0] != 0x01U) {
+    /* 3) Validate FCF: must be COMMAND type, ACK_REQ set */
+    if (Proto_FCF_Type(beacon.fcf) != MICS_FCF_TYPE_COMMAND) {
         return -3;
     }
 
-    /* Verify device ID matches ours or is broadcast */
-    bool id_match = true;
-    if (rx_len >= (1U + PROTO_DEVICE_ID_LEN)) {
-        for (uint8_t i = 0U; i < PROTO_DEVICE_ID_LEN; i++) {
-            if ((rx_buf[1U + i] != g_my_id[i]) && (rx_buf[1U + i] != 0xFFU)) {
-                id_match = false;
-                break;
-            }
-        }
-    }
-
-    if (!id_match) {
+    /* 4) Validate payload layout:
+     *    [0] DTYPE_COMMAND  [1] CMD_WAKEUP_REQ
+     *    [2..5] DEVICE_ID   [6] SESS  [7] flags
+     */
+    if (beacon.payload_len < PROTO_BEACON_PAYLOAD_LEN) {
         return -4;
     }
+    if (beacon.payload[PROTO_BEACON_DTYPE_OFFSET] != MICS_DTYPE_COMMAND) {
+        return -5;
+    }
+    if (beacon.payload[PROTO_BEACON_CMD_OFFSET] != CMD_WAKEUP_REQ) {
+        return -6;
+    }
 
-    /* Send wake-up ACK */
-    Proto_Packet ack_pkt;
-    ack_pkt.cmd = CMD_WAKEUP_ACK;
-    ack_pkt.seq = g_seq++;
-    memcpy(ack_pkt.device_id, g_my_id, PROTO_DEVICE_ID_LEN);
-    ack_pkt.payload_len = 0U;
+    /* 5) Verify this beacon is addressed to us (or broadcast) */
+    const uint8_t *target_id = &beacon.payload[PROTO_BEACON_DEVID_OFFSET];
+    if (!Proto_MatchDeviceID(target_id, g_my_id)) {
+        return -7;
+    }
+
+    /* 6) Remember the SESS assigned by Master */
+    uint8_t assigned_sess = beacon.payload[PROTO_BEACON_SESS_OFFSET];
+    if ((assigned_sess == PROTO_SESS_UNASSIGNED) ||
+        (assigned_sess == PROTO_SESS_BROADCAST)) {
+        return -8; /* invalid SESS allocation */
+    }
+    g_session_id = assigned_sess;
+
+    /* 7) Build and send wake-up ACK: echo DEVICE_ID+SESS in payload */
+    Proto_Packet ack;
+    ack.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+    ack.seq  = g_seq++;
+    ack.sess = PROTO_SESS_BROADCAST;  /* session not yet bilaterally confirmed */
+    ack.payload_len = Proto_BuildBeaconPayload(CMD_WAKEUP_ACK,
+                                               g_my_id,
+                                               g_session_id,
+                                               0U,
+                                               ack.payload,
+                                               sizeof(ack.payload));
+    if (ack.payload_len == 0U) {
+        return -9;
+    }
 
     uint8_t tx_buf[CC2500_PKT_MAX_LEN];
-    uint8_t tx_len = Proto_BuildPacket(&ack_pkt, tx_buf, sizeof(tx_buf));
+    uint8_t tx_len = Proto_BuildPacket(&ack, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
-        return -5;
+        return -10;
     }
 
     st = CC2500_SendPacketDirect(&g_cc2500, CC2500_WAKEUP_CHANNEL,
                                  tx_buf, tx_len, 100U);
     if (st != CC2500_OK) {
-        return -6;
+        return -11;
     }
 
     return 0;
@@ -216,83 +238,82 @@ static int Slave_HandleWakeUp(void)
 
 static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
 {
-    resp->seq = req->seq;
-    memcpy(resp->device_id, g_my_id, PROTO_DEVICE_ID_LEN);
+    /* Session is already validated by caller; just echo SESS */
+    resp->seq  = req->seq;
+    resp->sess = g_session_id;
 
-    switch (req->cmd) {
+    /* All inbound packets use COMMAND frames with payload[0]=DTYPE_COMMAND,
+     * payload[1]=sub-command. */
+    if (req->payload_len < 2U) {
+        resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+        resp->payload[0] = MICS_DTYPE_COMMAND;
+        resp->payload[1] = CMD_DATA_ACK;
+        resp->payload[2] = PROTO_STATUS_ERR_UNKNOWN_CMD;
+        resp->payload_len = 3U;
+        return 0;
+    }
+
+    uint8_t sub_cmd = req->payload[1];
+
+    switch (sub_cmd) {
     case CMD_POLL_REQ:
-        resp->cmd = CMD_POLL_RESP;
-        memcpy(resp->payload, g_sensor_data, sizeof(g_sensor_data));
-        resp->payload_len = (uint8_t)sizeof(g_sensor_data);
+        /* Respond with DATA-type frame carrying sensor payload. */
+        resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_DATA, false, false);
+        resp->payload[0] = MICS_DTYPE_ECG_DELTA; /* example data type */
+        memcpy(&resp->payload[1], g_sensor_data, sizeof(g_sensor_data));
+        resp->payload_len = (uint8_t)(1U + sizeof(g_sensor_data));
         break;
 
     case CMD_DATA_WRITE:
-        /* Write configuration/parameters from Master */
-        if (req->payload_len > 0U) {
-            /* Application-specific write handling */
-            /* e.g., update sensor thresholds, calibration data */
-            resp->cmd = CMD_DATA_ACK;
-            resp->payload[0] = PROTO_STATUS_OK;
-            resp->payload_len = 1U;
-        } else {
-            resp->cmd = CMD_DATA_ACK;
-            resp->payload[0] = PROTO_STATUS_ERR_UNKNOWN_CMD;
-            resp->payload_len = 1U;
-        }
+        /* Accept config/parameters (req->payload[2..]) */
+        resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+        resp->payload[0] = MICS_DTYPE_COMMAND;
+        resp->payload[1] = CMD_DATA_ACK;
+        resp->payload[2] = (req->payload_len > 2U) ? PROTO_STATUS_OK
+                                                    : PROTO_STATUS_ERR_UNKNOWN_CMD;
+        resp->payload_len = 3U;
         break;
 
     case CMD_SLEEP_CMD:
-        resp->cmd = CMD_SLEEP_ACK;
-        resp->payload_len = 0U;
+        resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+        resp->payload[0] = MICS_DTYPE_COMMAND;
+        resp->payload[1] = CMD_SLEEP_ACK;
+        resp->payload_len = 2U;
         break;
 
     case CMD_KEEPALIVE:
-        resp->cmd = CMD_KEEPALIVE_ACK;
-        resp->payload_len = 0U;
+        resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+        resp->payload[0] = MICS_DTYPE_COMMAND;
+        resp->payload[1] = CMD_KEEPALIVE_ACK;
+        resp->payload_len = 2U;
         break;
 
     default:
-        resp->cmd = CMD_DATA_ACK;
-        resp->payload[0] = PROTO_STATUS_ERR_UNKNOWN_CMD;
-        resp->payload_len = 1U;
+        resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+        resp->payload[0] = MICS_DTYPE_COMMAND;
+        resp->payload[1] = CMD_DATA_ACK;
+        resp->payload[2] = PROTO_STATUS_ERR_UNKNOWN_CMD;
+        resp->payload_len = 3U;
         break;
     }
 
     return 0;
 }
 
-static void Slave_SendResponse(const Proto_Packet *resp)
+static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel)
 {
     uint8_t tx_buf[CC1101_PKT_MAX_LEN];
     uint8_t tx_len = Proto_BuildPacket(resp, tx_buf, sizeof(tx_buf));
-
     if (tx_len == 0U) {
         return;
     }
 
-    /* Slave does NOT perform LBT - responds directly on the channel
-     * Master selected (Master already performed LBT) */
-    uint8_t fifo[1U + CC1101_PKT_MAX_LEN];
-    fifo[0] = tx_len;
-    memcpy(&fifo[1], tx_buf, tx_len);
-
-    CC1101_FlushTx(&g_cc1101);
-
-    /* Direct TX without LBT (Slave privilege - responds to Master's channel) */
-    CC1101_Status st;
-    uint8_t dummy = 0U;
-
-    /* Write to FIFO and send */
-    st = CC1101_SetChannel(&g_cc1101, 0U); /* channel already set from RX */
-    (void)st;
-
-    /* Use the low-level approach: write FIFO then strobe TX */
-    /* The channel is already set from the RX phase */
-
-    /* Re-use SendPacketLBT with very low listen time as direct send */
-    /* This is safe because Master has already cleared the channel */
-    CC1101_SendPacketLBT(&g_cc1101, 0U, tx_buf, tx_len,
-                         -120, 1U, 200U);  /* -120 dBm threshold = always pass */
+    /* Slave responds on the channel Master selected (Master already cleared
+     * it via LBT). Use SendPacketLBT with threshold=-120 dBm so the CCA
+     * always passes (effectively direct send). */
+    (void)CC1101_SendPacketLBT(&g_cc1101, channel,
+                               tx_buf, tx_len,
+                               -120, 1U, 200U);
 }
 
 static int Slave_HandleMICSSession(void)
@@ -314,54 +335,43 @@ static int Slave_HandleMICSSession(void)
         }
 
         /* Scan all MICS channels for Master's command */
-        bool pkt_received = false;
-
         for (uint8_t ch = 0U; ch < CC1101_MICS_NUM_CHANNELS; ch++) {
             CC1101_Status st = CC1101_WaitAndReadPacket(&g_cc1101,
                                                         ch,
                                                         rx_buf, &rx_len,
                                                         sizeof(rx_buf),
                                                         50U); /* 50 ms per channel */
-            if (st == CC1101_OK) {
-                pkt_received = true;
-
-                if (Proto_ParsePacket(rx_buf, rx_len, &req_pkt) < 0) {
-                    continue;
-                }
-
-                /* Verify packet is addressed to us */
-                if (!Proto_MatchDeviceID(req_pkt.device_id, g_my_id)) {
-                    continue;
-                }
-
-                /* Process command and build response */
-                Slave_ProcessCommand(&req_pkt, &resp_pkt);
-
-                /* Send response on the same channel */
-                uint8_t tx_buf[CC1101_PKT_MAX_LEN];
-                uint8_t tx_len = Proto_BuildPacket(&resp_pkt, tx_buf, sizeof(tx_buf));
-                if (tx_len > 0U) {
-                    /* Respond with minimal LBT (channel is reserved by Master) */
-                    CC1101_SendPacketLBT(&g_cc1101, ch, tx_buf, tx_len,
-                                        -120, 1U, 200U);
-                }
-
-                /* Check if session should end */
-                if (req_pkt.cmd == CMD_SLEEP_CMD) {
-                    session_active = false;
-                }
-
-                /* Reset session timer on valid packet */
-                session_start = HAL_GetTick();
-                break;  /* break channel scan, wait for next command */
+            if (st != CC1101_OK) {
+                continue;
             }
-        }
 
-        if (!pkt_received) {
-            /* No packet on any channel - continue scanning */
+            if (Proto_ParsePacket(rx_buf, rx_len, &req_pkt) < 0) {
+                continue;
+            }
+
+            /* Filter by session ID */
+            if (!Proto_MatchSession(req_pkt.sess, g_session_id)) {
+                continue;
+            }
+
+            /* Process command and send response on the same channel */
+            Slave_ProcessCommand(&req_pkt, &resp_pkt);
+            Slave_SendResponse(&resp_pkt, ch);
+
+            /* Check if session should end (SLEEP command) */
+            if ((req_pkt.payload_len >= 2U) &&
+                (req_pkt.payload[1] == CMD_SLEEP_CMD)) {
+                session_active = false;
+            }
+
+            /* Reset session timer on valid packet */
+            session_start = HAL_GetTick();
+            break;  /* break channel scan, wait for next command */
         }
     }
 
+    /* Invalidate session */
+    g_session_id = PROTO_SESS_UNASSIGNED;
     return 0;
 }
 
@@ -392,7 +402,7 @@ int main(void)
         if (g_wakeup_flag) {
             g_wakeup_flag = false;
 
-            /* Handle the wake-up beacon */
+            /* Handle the wake-up beacon - parses and stores SESS */
             int rc = Slave_HandleWakeUp();
 
             if (rc == 0) {

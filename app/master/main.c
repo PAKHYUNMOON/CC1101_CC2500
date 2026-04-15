@@ -2,11 +2,11 @@
  * Master (Programmer) - External Device Application
  *
  * Communication flow:
- *   1. CC2500 sends wake-up beacon (2.4 GHz) to implant
- *   2. CC2500 waits for wake-up ACK from implant
+ *   1. CC2500 sends wake-up beacon (2.4 GHz) with DEVICE_ID+SESS in payload
+ *   2. CC2500 waits for wake-up ACK (payload echoes DEVICE_ID+SESS)
  *   3. CC1101 performs LBT to find a free MICS channel (400 MHz)
- *   4. CC1101 sends POLL/DATA commands with channel agility
- *   5. CC1101 receives responses from implant
+ *   4. CC1101 sends POLL/DATA commands tagged with SESS; channel agility
+ *   5. CC1101 receives responses filtered by SESS
  *   6. CC1101 sends SLEEP command to implant
  *   7. Both radios return to idle/sleep
  *
@@ -34,6 +34,8 @@ extern RTC_HandleTypeDef hrtc;
 static uint8_t g_seq = 0U;
 static uint8_t g_target_id[PROTO_DEVICE_ID_LEN] = {0x00, 0x00, 0x00, 0x01};
 static uint8_t g_active_channel = 0U;
+static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED;
+static uint8_t g_next_sess      = 1U;   /* rolling session ID generator */
 
 /* ---------- forward declarations ---------- */
 static void Master_InitHardware(void);
@@ -88,47 +90,108 @@ static void Master_InitHardware(void)
 }
 
 /* ========================================================================== */
+/* Allocate next session ID (skips reserved values)                            */
+/* ========================================================================== */
+static uint8_t Master_AllocateSession(void)
+{
+    uint8_t s = g_next_sess++;
+    if (g_next_sess == PROTO_SESS_BROADCAST) {
+        g_next_sess = 1U; /* skip 0x00 and 0xFF */
+    }
+    if (s == PROTO_SESS_UNASSIGNED) {
+        s = 1U;
+    }
+    return s;
+}
+
+/* ========================================================================== */
 /* Phase 1: Wake-up via CC2500 (2.4 GHz)                                      */
 /* ========================================================================== */
 
 static int Master_WakeUpImplant(void)
 {
+    uint8_t tx_buf[CC2500_PKT_MAX_LEN];
     uint8_t rx_buf[CC2500_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
-    Proto_Packet ack_pkt;
 
-    /* Send repeated wake-up beacons */
-    CC2500_Status st = CC2500_SendWakeUpBeacon(&g_cc2500,
-                                               g_target_id,
-                                               PROTO_DEVICE_ID_LEN,
-                                               PROTO_WAKEUP_BEACON_REPEAT);
-    if (st != CC2500_OK) {
+    /* 1) Propose a new SESS for this session */
+    uint8_t proposed_sess = Master_AllocateSession();
+
+    /* 2) Build beacon MAC PDU:
+     *    FCF  = COMMAND | ACK_REQ
+     *    SESS = BROADCAST (session not yet established)
+     *    PAYLOAD[0] = DTYPE_COMMAND
+     *    PAYLOAD[1] = CMD_WAKEUP_REQ
+     *    PAYLOAD[2..5] = target DEVICE_ID
+     *    PAYLOAD[6] = proposed SESS
+     *    PAYLOAD[7] = flags
+     */
+    Proto_Packet beacon_pkt;
+    beacon_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
+    beacon_pkt.seq  = g_seq++;
+    beacon_pkt.sess = PROTO_SESS_BROADCAST;
+    beacon_pkt.payload_len = Proto_BuildBeaconPayload(CMD_WAKEUP_REQ,
+                                                      g_target_id,
+                                                      proposed_sess,
+                                                      0U,
+                                                      beacon_pkt.payload,
+                                                      sizeof(beacon_pkt.payload));
+    if (beacon_pkt.payload_len == 0U) {
         return -1;
     }
 
-    /* Wait for wake-up ACK on the same channel */
+    uint8_t tx_len = Proto_BuildPacket(&beacon_pkt, tx_buf, sizeof(tx_buf));
+    if (tx_len == 0U) {
+        return -2;
+    }
+
+    /* 3) Repeatedly transmit the beacon so at least one WOR window catches it */
+    CC2500_Status st = CC2500_SendWakeUpBeacon(&g_cc2500,
+                                               tx_buf, tx_len,
+                                               PROTO_WAKEUP_BEACON_REPEAT);
+    if (st != CC2500_OK) {
+        return -3;
+    }
+
+    /* 4) Wait for wake-up ACK on the same channel */
     st = CC2500_WaitAndReadPacket(&g_cc2500,
                                   CC2500_WAKEUP_CHANNEL,
                                   rx_buf, &rx_len,
                                   sizeof(rx_buf),
                                   PROTO_WAKEUP_ACK_TIMEOUT_MS);
     if (st != CC2500_OK) {
-        return -2;
-    }
-
-    /* Parse and verify ACK */
-    if (Proto_ParsePacket(rx_buf, rx_len, &ack_pkt) < 0) {
-        return -3;
-    }
-
-    if (ack_pkt.cmd != CMD_WAKEUP_ACK) {
         return -4;
     }
 
-    if (!Proto_MatchDeviceID(ack_pkt.device_id, g_target_id)) {
+    /* 5) Parse and verify ACK:
+     *    - FCF type = COMMAND
+     *    - payload[1] = CMD_WAKEUP_ACK
+     *    - payload[2..5] = our target DEVICE_ID
+     *    - payload[6]   = echoed SESS (must match proposed_sess)
+     */
+    Proto_Packet ack_pkt;
+    if (Proto_ParsePacket(rx_buf, rx_len, &ack_pkt) < 0) {
         return -5;
     }
+    if (Proto_FCF_Type(ack_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
+        return -6;
+    }
+    if (ack_pkt.payload_len < PROTO_BEACON_PAYLOAD_LEN) {
+        return -7;
+    }
+    if (ack_pkt.payload[PROTO_BEACON_CMD_OFFSET] != CMD_WAKEUP_ACK) {
+        return -8;
+    }
+    if (!Proto_MatchDeviceID(&ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET],
+                             g_target_id)) {
+        return -9;
+    }
+    if (ack_pkt.payload[PROTO_BEACON_SESS_OFFSET] != proposed_sess) {
+        return -10;
+    }
 
+    /* 6) Session established */
+    g_session_id = proposed_sess;
     return 0;
 }
 
@@ -143,11 +206,18 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     uint8_t rx_buf[CC1101_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    /* Build POLL request */
-    poll_pkt.cmd = CMD_POLL_REQ;
-    poll_pkt.seq = g_seq++;
-    memcpy(poll_pkt.device_id, g_target_id, PROTO_DEVICE_ID_LEN);
-    poll_pkt.payload_len = 0U;
+    /* Build POLL request:
+     *   FCF  = COMMAND | ACK_REQ
+     *   SESS = established session
+     *   payload[0] = DTYPE_COMMAND
+     *   payload[1] = CMD_POLL_REQ
+     */
+    poll_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
+    poll_pkt.seq  = g_seq++;
+    poll_pkt.sess = g_session_id;
+    poll_pkt.payload[0] = MICS_DTYPE_COMMAND;
+    poll_pkt.payload[1] = CMD_POLL_REQ;
+    poll_pkt.payload_len = 2U;
 
     uint8_t tx_len = Proto_BuildPacket(&poll_pkt, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
@@ -181,15 +251,30 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     if (Proto_ParsePacket(rx_buf, rx_len, &resp_pkt) < 0) {
         return -4;
     }
-
-    if (resp_pkt.cmd != CMD_POLL_RESP) {
+    if (!Proto_MatchSession(resp_pkt.sess, g_session_id)) {
         return -5;
     }
+    if (resp_pkt.payload_len < 2U) {
+        return -6;
+    }
 
-    /* Copy payload to caller */
+    /* Expect DATA-type response carrying sensor payload, or
+     * COMMAND-type CMD_POLL_RESP for legacy compatibility. */
+    uint8_t ftype = Proto_FCF_Type(resp_pkt.fcf);
+    if ((ftype != MICS_FCF_TYPE_DATA) && (ftype != MICS_FCF_TYPE_COMMAND)) {
+        return -7;
+    }
+
+    /* Copy payload (skip 2-byte DTYPE+CMD header if COMMAND type) */
+    uint8_t pl_offset = (ftype == MICS_FCF_TYPE_COMMAND) ? 2U : 1U;
+    if (resp_pkt.payload_len < pl_offset) {
+        return -8;
+    }
+
     if ((resp_buf != NULL) && (resp_len != NULL)) {
-        memcpy(resp_buf, resp_pkt.payload, resp_pkt.payload_len);
-        *resp_len = resp_pkt.payload_len;
+        uint8_t n = (uint8_t)(resp_pkt.payload_len - pl_offset);
+        memcpy(resp_buf, &resp_pkt.payload[pl_offset], n);
+        *resp_len = n;
     }
 
     return 0;
@@ -202,16 +287,19 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     uint8_t rx_buf[CC1101_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    if ((data == NULL) || (len == 0U) || (len > PROTO_MAX_PAYLOAD)) {
+    /* +2 for DTYPE + CMD header in payload */
+    if ((data == NULL) || (len == 0U) || (len > (PROTO_MAX_PAYLOAD - 2U))) {
         return -1;
     }
 
     /* Build DATA_WRITE packet */
-    write_pkt.cmd = CMD_DATA_WRITE;
-    write_pkt.seq = g_seq++;
-    memcpy(write_pkt.device_id, g_target_id, PROTO_DEVICE_ID_LEN);
-    memcpy(write_pkt.payload, data, len);
-    write_pkt.payload_len = len;
+    write_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
+    write_pkt.seq  = g_seq++;
+    write_pkt.sess = g_session_id;
+    write_pkt.payload[0] = MICS_DTYPE_COMMAND;
+    write_pkt.payload[1] = CMD_DATA_WRITE;
+    memcpy(&write_pkt.payload[2], data, len);
+    write_pkt.payload_len = (uint8_t)(2U + len);
 
     uint8_t tx_len = Proto_BuildPacket(&write_pkt, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
@@ -243,14 +331,17 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     if (Proto_ParsePacket(rx_buf, rx_len, &ack_pkt) < 0) {
         return -5;
     }
-
-    if (ack_pkt.cmd != CMD_DATA_ACK) {
+    if (!Proto_MatchSession(ack_pkt.sess, g_session_id)) {
         return -6;
     }
-
-    /* Check status in payload */
-    if ((ack_pkt.payload_len > 0U) && (ack_pkt.payload[0] != PROTO_STATUS_OK)) {
+    if (ack_pkt.payload_len < 3U) {
         return -7;
+    }
+    if (ack_pkt.payload[1] != CMD_DATA_ACK) {
+        return -8;
+    }
+    if (ack_pkt.payload[2] != PROTO_STATUS_OK) {
+        return -9;
     }
 
     return 0;
@@ -267,10 +358,12 @@ static int Master_SendSleepCommand(void)
     uint8_t rx_buf[CC1101_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    sleep_pkt.cmd = CMD_SLEEP_CMD;
-    sleep_pkt.seq = g_seq++;
-    memcpy(sleep_pkt.device_id, g_target_id, PROTO_DEVICE_ID_LEN);
-    sleep_pkt.payload_len = 0U;
+    sleep_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+    sleep_pkt.seq  = g_seq++;
+    sleep_pkt.sess = g_session_id;
+    sleep_pkt.payload[0] = MICS_DTYPE_COMMAND;
+    sleep_pkt.payload[1] = CMD_SLEEP_CMD;
+    sleep_pkt.payload_len = 2U;
 
     uint8_t tx_len = Proto_BuildPacket(&sleep_pkt, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
@@ -295,6 +388,9 @@ static int Master_SendSleepCommand(void)
                                   PROTO_SLEEP_CONFIRM_TIMEOUT_MS);
     /* Even if ACK times out, implant will auto-sleep */
     (void)st;
+
+    /* Invalidate session */
+    g_session_id = PROTO_SESS_UNASSIGNED;
 
     return 0;
 }
