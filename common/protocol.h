@@ -129,18 +129,62 @@ extern "C" {
  *   Offset 1    : CMD_WAKEUP_REQ (0x01) or CMD_WAKEUP_ACK (0x02)
  *   Offset 2..5 : DEVICE_ID  (target / responder)
  *   Offset 6    : SESS       (session ID proposed / echoed)
- *   Offset 7    : flags / reserved
+ *   Offset 7    : CHANNEL    (MICS channel 0..9 pre-selected by Master via LBT)
+ *   Offset 8    : flags / reserved
  *
  * FCF for wake-up = MICS_FCF_TYPE_COMMAND | MICS_FCF_ACK_REQ
  * The MAC-header SESS field is set to PROTO_SESS_BROADCAST during beacon;
  * assigned SESS is transported inside the payload.
+ *
+ * CHANNEL field is assigned by Master *before* the beacon is sent:
+ *   1) Master runs CC1101_FindFreeChannel() over MICS ch 0..9
+ *   2) Free channel number is embedded at offset 7 of the beacon payload
+ *   3) Slave reads the channel and tunes CC1101 directly to it - no scanning
+ *   4) Slave echoes the same channel in the wake-up ACK for confirmation
  * ========================================================================== */
 #define PROTO_BEACON_DTYPE_OFFSET    0U
 #define PROTO_BEACON_CMD_OFFSET      1U
 #define PROTO_BEACON_DEVID_OFFSET    2U
 #define PROTO_BEACON_SESS_OFFSET     6U
-#define PROTO_BEACON_FLAGS_OFFSET    7U
-#define PROTO_BEACON_PAYLOAD_LEN     8U
+#define PROTO_BEACON_CHANNEL_OFFSET  7U
+#define PROTO_BEACON_FLAGS_OFFSET    8U
+#define PROTO_BEACON_PAYLOAD_LEN     9U
+
+#define PROTO_CHANNEL_UNASSIGNED     0xFFU   /* no channel pre-selected */
+
+/* ==========================================================================
+ * 400 MHz COMMAND frame PAYLOAD layout (FCF type = MICS_FCF_TYPE_COMMAND)
+ *
+ *   Offset 0    : MICS_DTYPE_COMMAND (0xA0)
+ *   Offset 1    : sub-command (CMD_POLL_REQ, CMD_DATA_WRITE, ...)
+ *   Offset 2..5 : DEVICE_ID  (Implant identity, carried from 2.4 GHz wake-up)
+ *   Offset 6..  : command-specific arguments
+ *
+ * The DEVICE_ID at offset 2..5 is the *Implant's* (Slave's) ID on every
+ * 400 MHz COMMAND frame, regardless of direction.  Purpose:
+ *   - Master → Slave: proves Master still knows the Slave it woke up
+ *   - Slave  → Master: proves the responder is the same Slave that
+ *                      accepted the wake-up on 2.4 GHz
+ * Both ends verify DEVICE_ID in addition to SESS on every COMMAND packet.
+ * ========================================================================== */
+#define PROTO_CMD_DTYPE_OFFSET       0U
+#define PROTO_CMD_SUBCMD_OFFSET      1U
+#define PROTO_CMD_DEVID_OFFSET       2U
+#define PROTO_CMD_ARGS_OFFSET        6U
+#define PROTO_CMD_HEADER_LEN         6U      /* DTYPE + SUBCMD + DEVID[4] */
+
+/* ==========================================================================
+ * 400 MHz DATA frame PAYLOAD layout (FCF type = MICS_FCF_TYPE_DATA)
+ *
+ *   Offset 0    : data type (MICS_DTYPE_ECG_DELTA, _BATTERY, _TEMP, ...)
+ *   Offset 1..4 : DEVICE_ID  (Implant identity, proves DATA is from the
+ *                             same Slave that was woken up)
+ *   Offset 5..  : actual telemetry / data body
+ * ========================================================================== */
+#define PROTO_DATA_DTYPE_OFFSET      0U
+#define PROTO_DATA_DEVID_OFFSET      1U
+#define PROTO_DATA_BODY_OFFSET       5U
+#define PROTO_DATA_HEADER_LEN        5U      /* DTYPE + DEVID[4] */
 
 /* ---------- timing constants ---------- */
 #define PROTO_WAKEUP_BEACON_REPEAT   10U
@@ -271,24 +315,106 @@ static inline bool Proto_MatchDeviceID(const uint8_t *id_a, const uint8_t *id_b)
 
 /* ==========================================================================
  * Convenience: build / parse Wake-up beacon payload body
+ *
+ *   cmd        : CMD_WAKEUP_REQ (Master→Slave) or CMD_WAKEUP_ACK (Slave→Master)
+ *   device_id  : target DEVICE_ID (4 B)
+ *   sess       : proposed / echoed SESS (0x01..0xFE)
+ *   channel    : MICS channel 0..9 pre-selected by Master (PROTO_CHANNEL_UNASSIGNED
+ *                if not yet assigned, not recommended)
+ *   flags      : reserved
  * ========================================================================== */
 static inline uint8_t Proto_BuildBeaconPayload(uint8_t cmd,
                                                const uint8_t *device_id,
-                                               uint8_t sess, uint8_t flags,
+                                               uint8_t sess,
+                                               uint8_t channel,
+                                               uint8_t flags,
                                                uint8_t *out, uint8_t out_size)
 {
     if ((device_id == NULL) || (out == NULL) ||
         (out_size < PROTO_BEACON_PAYLOAD_LEN)) {
         return 0U;
     }
-    out[PROTO_BEACON_DTYPE_OFFSET] = MICS_DTYPE_COMMAND;
-    out[PROTO_BEACON_CMD_OFFSET]   = cmd;
+    out[PROTO_BEACON_DTYPE_OFFSET]   = MICS_DTYPE_COMMAND;
+    out[PROTO_BEACON_CMD_OFFSET]     = cmd;
     for (uint8_t i = 0U; i < PROTO_DEVICE_ID_LEN; i++) {
         out[PROTO_BEACON_DEVID_OFFSET + i] = device_id[i];
     }
-    out[PROTO_BEACON_SESS_OFFSET]  = sess;
-    out[PROTO_BEACON_FLAGS_OFFSET] = flags;
+    out[PROTO_BEACON_SESS_OFFSET]    = sess;
+    out[PROTO_BEACON_CHANNEL_OFFSET] = channel;
+    out[PROTO_BEACON_FLAGS_OFFSET]   = flags;
     return PROTO_BEACON_PAYLOAD_LEN;
+}
+
+/* ==========================================================================
+ * Build a 400 MHz COMMAND-frame payload:
+ *   [DTYPE_COMMAND][sub_cmd][DEVICE_ID[4]][args...]
+ * Returns the number of bytes written to `out`, or 0 on error.
+ * ========================================================================== */
+static inline uint8_t Proto_BuildCommandPayload(uint8_t sub_cmd,
+                                                const uint8_t *device_id,
+                                                const uint8_t *args,
+                                                uint8_t args_len,
+                                                uint8_t *out, uint8_t out_size)
+{
+    uint8_t total = (uint8_t)(PROTO_CMD_HEADER_LEN + args_len);
+    if ((device_id == NULL) || (out == NULL) || (out_size < total)) {
+        return 0U;
+    }
+    out[PROTO_CMD_DTYPE_OFFSET]  = MICS_DTYPE_COMMAND;
+    out[PROTO_CMD_SUBCMD_OFFSET] = sub_cmd;
+    for (uint8_t i = 0U; i < PROTO_DEVICE_ID_LEN; i++) {
+        out[PROTO_CMD_DEVID_OFFSET + i] = device_id[i];
+    }
+    if ((args != NULL) && (args_len > 0U)) {
+        for (uint8_t i = 0U; i < args_len; i++) {
+            out[PROTO_CMD_ARGS_OFFSET + i] = args[i];
+        }
+    }
+    return total;
+}
+
+/* ==========================================================================
+ * Build a 400 MHz DATA-frame payload:
+ *   [dtype][DEVICE_ID[4]][body...]
+ * Returns the number of bytes written to `out`, or 0 on error.
+ * ========================================================================== */
+static inline uint8_t Proto_BuildDataPayload(uint8_t dtype,
+                                             const uint8_t *device_id,
+                                             const uint8_t *body,
+                                             uint8_t body_len,
+                                             uint8_t *out, uint8_t out_size)
+{
+    uint8_t total = (uint8_t)(PROTO_DATA_HEADER_LEN + body_len);
+    if ((device_id == NULL) || (out == NULL) || (out_size < total)) {
+        return 0U;
+    }
+    out[PROTO_DATA_DTYPE_OFFSET] = dtype;
+    for (uint8_t i = 0U; i < PROTO_DEVICE_ID_LEN; i++) {
+        out[PROTO_DATA_DEVID_OFFSET + i] = device_id[i];
+    }
+    if ((body != NULL) && (body_len > 0U)) {
+        for (uint8_t i = 0U; i < body_len; i++) {
+            out[PROTO_DATA_BODY_OFFSET + i] = body[i];
+        }
+    }
+    return total;
+}
+
+/* ==========================================================================
+ * Verify that a received packet's payload carries a matching DEVICE_ID.
+ * Caller must pass the correct offset for the frame type (COMMAND or DATA).
+ * ========================================================================== */
+static inline bool Proto_VerifyPayloadDeviceID(const Proto_Packet *pkt,
+                                               uint8_t devid_offset,
+                                               const uint8_t *expected_id)
+{
+    if ((pkt == NULL) || (expected_id == NULL)) {
+        return false;
+    }
+    if (pkt->payload_len < (devid_offset + PROTO_DEVICE_ID_LEN)) {
+        return false;
+    }
+    return Proto_MatchDeviceID(&pkt->payload[devid_offset], expected_id);
 }
 
 #ifdef __cplusplus

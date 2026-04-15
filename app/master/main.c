@@ -114,17 +114,29 @@ static int Master_WakeUpImplant(void)
     uint8_t rx_buf[CC2500_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    /* 1) Propose a new SESS for this session */
+    /* 1) Run LBT on CC1101 *before* sending the beacon so we can tell the
+     *    Slave which MICS channel to tune to. This eliminates Slave-side
+     *    channel scanning and its battery cost. */
+    int8_t free_ch = CC1101_FindFreeChannel(&g_cc1101,
+                                            CC1101_MICS_LBT_THRESHOLD_DBM,
+                                            CC1101_MICS_LBT_LISTEN_MS);
+    if (free_ch < 0) {
+        return -1;   /* all MICS channels busy - retry later */
+    }
+    g_active_channel = (uint8_t)free_ch;
+
+    /* 2) Propose a new SESS for this session */
     uint8_t proposed_sess = Master_AllocateSession();
 
-    /* 2) Build beacon MAC PDU:
+    /* 3) Build beacon MAC PDU:
      *    FCF  = COMMAND | ACK_REQ
      *    SESS = BROADCAST (session not yet established)
-     *    PAYLOAD[0] = DTYPE_COMMAND
-     *    PAYLOAD[1] = CMD_WAKEUP_REQ
+     *    PAYLOAD[0]    = DTYPE_COMMAND
+     *    PAYLOAD[1]    = CMD_WAKEUP_REQ
      *    PAYLOAD[2..5] = target DEVICE_ID
-     *    PAYLOAD[6] = proposed SESS
-     *    PAYLOAD[7] = flags
+     *    PAYLOAD[6]    = proposed SESS
+     *    PAYLOAD[7]    = assigned MICS channel (from LBT)
+     *    PAYLOAD[8]    = flags
      */
     Proto_Packet beacon_pkt;
     beacon_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
@@ -133,11 +145,12 @@ static int Master_WakeUpImplant(void)
     beacon_pkt.payload_len = Proto_BuildBeaconPayload(CMD_WAKEUP_REQ,
                                                       g_target_id,
                                                       proposed_sess,
+                                                      g_active_channel,
                                                       0U,
                                                       beacon_pkt.payload,
                                                       sizeof(beacon_pkt.payload));
     if (beacon_pkt.payload_len == 0U) {
-        return -1;
+        return -2;
     }
 
     uint8_t tx_len = Proto_BuildPacket(&beacon_pkt, tx_buf, sizeof(tx_buf));
@@ -145,7 +158,7 @@ static int Master_WakeUpImplant(void)
         return -2;
     }
 
-    /* 3) Repeatedly transmit the beacon so at least one WOR window catches it */
+    /* 4) Repeatedly transmit the beacon so at least one WOR window catches it */
     CC2500_Status st = CC2500_SendWakeUpBeacon(&g_cc2500,
                                                tx_buf, tx_len,
                                                PROTO_WAKEUP_BEACON_REPEAT);
@@ -153,7 +166,7 @@ static int Master_WakeUpImplant(void)
         return -3;
     }
 
-    /* 4) Wait for wake-up ACK on the same channel */
+    /* 5) Wait for wake-up ACK on the same channel */
     st = CC2500_WaitAndReadPacket(&g_cc2500,
                                   CC2500_WAKEUP_CHANNEL,
                                   rx_buf, &rx_len,
@@ -163,11 +176,12 @@ static int Master_WakeUpImplant(void)
         return -4;
     }
 
-    /* 5) Parse and verify ACK:
+    /* 6) Parse and verify ACK:
      *    - FCF type = COMMAND
      *    - payload[1] = CMD_WAKEUP_ACK
      *    - payload[2..5] = our target DEVICE_ID
      *    - payload[6]   = echoed SESS (must match proposed_sess)
+     *    - payload[7]   = echoed CHANNEL (must match g_active_channel)
      */
     Proto_Packet ack_pkt;
     if (Proto_ParsePacket(rx_buf, rx_len, &ack_pkt) < 0) {
@@ -189,8 +203,11 @@ static int Master_WakeUpImplant(void)
     if (ack_pkt.payload[PROTO_BEACON_SESS_OFFSET] != proposed_sess) {
         return -10;
     }
+    if (ack_pkt.payload[PROTO_BEACON_CHANNEL_OFFSET] != g_active_channel) {
+        return -11;  /* Slave didn't acknowledge the assigned channel */
+    }
 
-    /* 6) Session established */
+    /* 7) Session established */
     g_session_id = proposed_sess;
     return 0;
 }
@@ -209,15 +226,21 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     /* Build POLL request:
      *   FCF  = COMMAND | ACK_REQ
      *   SESS = established session
-     *   payload[0] = DTYPE_COMMAND
-     *   payload[1] = CMD_POLL_REQ
+     *   payload = [DTYPE_COMMAND, CMD_POLL_REQ, DEVICE_ID[4]]
+     *   The DEVICE_ID proves to Slave that this Master knows the identity
+     *   handed off during the 2.4 GHz wake-up handshake.
      */
     poll_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
     poll_pkt.seq  = g_seq++;
     poll_pkt.sess = g_session_id;
-    poll_pkt.payload[0] = MICS_DTYPE_COMMAND;
-    poll_pkt.payload[1] = CMD_POLL_REQ;
-    poll_pkt.payload_len = 2U;
+    poll_pkt.payload_len = Proto_BuildCommandPayload(CMD_POLL_REQ,
+                                                     g_target_id,
+                                                     NULL, 0U,
+                                                     poll_pkt.payload,
+                                                     sizeof(poll_pkt.payload));
+    if (poll_pkt.payload_len == 0U) {
+        return -1;
+    }
 
     uint8_t tx_len = Proto_BuildPacket(&poll_pkt, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
@@ -254,26 +277,32 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     if (!Proto_MatchSession(resp_pkt.sess, g_session_id)) {
         return -5;
     }
-    if (resp_pkt.payload_len < 2U) {
+
+    /* Verify DEVICE_ID in payload - must match the Slave we woke up on 2.4 GHz */
+    uint8_t ftype = Proto_FCF_Type(resp_pkt.fcf);
+    uint8_t devid_off, body_off;
+
+    if (ftype == MICS_FCF_TYPE_DATA) {
+        devid_off = PROTO_DATA_DEVID_OFFSET;
+        body_off  = PROTO_DATA_BODY_OFFSET;
+    } else if (ftype == MICS_FCF_TYPE_COMMAND) {
+        devid_off = PROTO_CMD_DEVID_OFFSET;
+        body_off  = PROTO_CMD_ARGS_OFFSET;
+    } else {
         return -6;
     }
 
-    /* Expect DATA-type response carrying sensor payload, or
-     * COMMAND-type CMD_POLL_RESP for legacy compatibility. */
-    uint8_t ftype = Proto_FCF_Type(resp_pkt.fcf);
-    if ((ftype != MICS_FCF_TYPE_DATA) && (ftype != MICS_FCF_TYPE_COMMAND)) {
-        return -7;
+    if (!Proto_VerifyPayloadDeviceID(&resp_pkt, devid_off, g_target_id)) {
+        return -7;  /* Device ID mismatch - possible spoofer or wrong Slave */
     }
 
-    /* Copy payload (skip 2-byte DTYPE+CMD header if COMMAND type) */
-    uint8_t pl_offset = (ftype == MICS_FCF_TYPE_COMMAND) ? 2U : 1U;
-    if (resp_pkt.payload_len < pl_offset) {
+    /* Copy application body to caller */
+    if (resp_pkt.payload_len < body_off) {
         return -8;
     }
-
     if ((resp_buf != NULL) && (resp_len != NULL)) {
-        uint8_t n = (uint8_t)(resp_pkt.payload_len - pl_offset);
-        memcpy(resp_buf, &resp_pkt.payload[pl_offset], n);
+        uint8_t n = (uint8_t)(resp_pkt.payload_len - body_off);
+        memcpy(resp_buf, &resp_pkt.payload[body_off], n);
         *resp_len = n;
     }
 
@@ -287,19 +316,24 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     uint8_t rx_buf[CC1101_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    /* +2 for DTYPE + CMD header in payload */
-    if ((data == NULL) || (len == 0U) || (len > (PROTO_MAX_PAYLOAD - 2U))) {
+    /* Command payload overhead = DTYPE + CMD + DEVID[4] = 6 bytes */
+    if ((data == NULL) || (len == 0U) ||
+        (len > (PROTO_MAX_PAYLOAD - PROTO_CMD_HEADER_LEN))) {
         return -1;
     }
 
-    /* Build DATA_WRITE packet */
+    /* Build DATA_WRITE packet with DEVICE_ID handoff */
     write_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
     write_pkt.seq  = g_seq++;
     write_pkt.sess = g_session_id;
-    write_pkt.payload[0] = MICS_DTYPE_COMMAND;
-    write_pkt.payload[1] = CMD_DATA_WRITE;
-    memcpy(&write_pkt.payload[2], data, len);
-    write_pkt.payload_len = (uint8_t)(2U + len);
+    write_pkt.payload_len = Proto_BuildCommandPayload(CMD_DATA_WRITE,
+                                                      g_target_id,
+                                                      data, len,
+                                                      write_pkt.payload,
+                                                      sizeof(write_pkt.payload));
+    if (write_pkt.payload_len == 0U) {
+        return -2;
+    }
 
     uint8_t tx_len = Proto_BuildPacket(&write_pkt, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
@@ -334,14 +368,22 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     if (!Proto_MatchSession(ack_pkt.sess, g_session_id)) {
         return -6;
     }
-    if (ack_pkt.payload_len < 3U) {
+    if (Proto_FCF_Type(ack_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
         return -7;
     }
-    if (ack_pkt.payload[1] != CMD_DATA_ACK) {
+    /* Verify DEVICE_ID handoff in ACK */
+    if (!Proto_VerifyPayloadDeviceID(&ack_pkt, PROTO_CMD_DEVID_OFFSET,
+                                     g_target_id)) {
         return -8;
     }
-    if (ack_pkt.payload[2] != PROTO_STATUS_OK) {
+    if (ack_pkt.payload_len < (PROTO_CMD_ARGS_OFFSET + 1U)) {
         return -9;
+    }
+    if (ack_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] != CMD_DATA_ACK) {
+        return -10;
+    }
+    if (ack_pkt.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+        return -11;
     }
 
     return 0;
@@ -361,9 +403,14 @@ static int Master_SendSleepCommand(void)
     sleep_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
     sleep_pkt.seq  = g_seq++;
     sleep_pkt.sess = g_session_id;
-    sleep_pkt.payload[0] = MICS_DTYPE_COMMAND;
-    sleep_pkt.payload[1] = CMD_SLEEP_CMD;
-    sleep_pkt.payload_len = 2U;
+    sleep_pkt.payload_len = Proto_BuildCommandPayload(CMD_SLEEP_CMD,
+                                                      g_target_id,
+                                                      NULL, 0U,
+                                                      sleep_pkt.payload,
+                                                      sizeof(sleep_pkt.payload));
+    if (sleep_pkt.payload_len == 0U) {
+        return -1;
+    }
 
     uint8_t tx_len = Proto_BuildPacket(&sleep_pkt, tx_buf, sizeof(tx_buf));
     if (tx_len == 0U) {
