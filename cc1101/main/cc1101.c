@@ -8,7 +8,7 @@
  * - Channels: 0..9  => 402.15, 402.45, ... 404.85 MHz
  * - Data rate: ~49.99 kbps
  * - RX BW: ~101.56 kHz
- * - Modulation: GFSK
+ * - Modulation: 2-FSK (MDMCFG2.MOD_FORMAT = 000)
  * - Deviation: ~20.63 kHz
  * - Packet mode: variable length + CRC + append status
  * - GDO0: asserts when packet received with CRC OK
@@ -379,7 +379,7 @@ CC1101_Status CC1101_InitMICSLike26MHz(CC1101_HandleTypeDef *dev)
         /* Modem */
         { CC1101_MDMCFG4,  0xCA }, /* RX BW ~101.56kHz, DRATE_E=10 */
         { CC1101_MDMCFG3,  0xF8 }, /* DRATE_M=248 -> ~49.99kbps */
-        { CC1101_MDMCFG2,  0x13 }, /* GFSK, 30/32 sync */
+        { CC1101_MDMCFG2,  0x03 }, /* 2-FSK, 30/32 sync */
         { CC1101_MDMCFG1,  0x23 }, /* 4-byte preamble, CHANSPC_E=3 */
         { CC1101_MDMCFG0,  0x7A }, /* CHANSPC_M=122 -> ~299.93kHz */
         { CC1101_DEVIATN,  0x35 }, /* ~20.63kHz */
