@@ -26,6 +26,10 @@
 #include "stm32u575_lowpower.h"
 #include <string.h>
 
+#define AUTH_NONCE_LEN 4U
+#define AUTH_TAG_LEN   4U
+#define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
+
 /* ---------- low-power tuning knobs ---------- */
 #define SLAVE_RTC_WAKEUP_INTERVAL_S   300U  /* raise to reduce periodic wakeups */
 #define SLAVE_MICS_RX_WINDOW_MS       50U   /* lower to reduce active RX duty */
@@ -79,6 +83,14 @@ static volatile bool g_wakeup_flag = false;
 static uint8_t g_seq = 0U;
 static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED; /* assigned by Master wake-up */
 static uint8_t g_active_channel = PROTO_CHANNEL_UNASSIGNED; /* MICS channel carried in beacon */
+static uint8_t g_last_rx_seq = 0U;
+static bool    g_last_rx_seq_valid = false;
+static uint8_t g_session_nonce[AUTH_NONCE_LEN] = {0};
+
+static const uint8_t g_auth_key[16] = {
+    0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
+    0x91, 0x2B, 0xC4, 0x6E, 0x58, 0xFD, 0x03, 0xAB
+};
 
 /* ---------- simulated sensor data ---------- */
 static uint8_t g_sensor_data[16] = {
@@ -95,6 +107,9 @@ static int  Slave_HandleWakeUp(void);
 static int  Slave_HandleMICSSession(void);
 static int  Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp);
 static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel);
+static uint32_t Slave_Mac32(const uint8_t *buf, uint8_t len);
+static bool Slave_VerifyPollAuth(const Proto_Packet *req);
+static uint8_t Slave_BuildPollDataBody(uint8_t *out, uint8_t out_size);
 
 /* ========================================================================== */
 /* EXTI callback - CC2500 GDO0 wake-up interrupt                              */
@@ -148,6 +163,73 @@ static void Slave_InitHardware(void)
 
     /* Initialize CC2500 for WOR wake-up mode */
     CC2500_InitWakeUp26MHz(&g_cc2500);
+}
+
+static uint32_t Slave_Mac32(const uint8_t *buf, uint8_t len)
+{
+    uint32_t h = 2166136261UL;
+    for (uint8_t i = 0U; i < sizeof(g_auth_key); i++) {
+        h ^= g_auth_key[i];
+        h *= 16777619UL;
+    }
+    for (uint8_t i = 0U; i < len; i++) {
+        h ^= buf[i];
+        h *= 16777619UL;
+    }
+    return h;
+}
+
+static bool Slave_VerifyPollAuth(const Proto_Packet *req)
+{
+    if (req->payload_len < (uint8_t)(PROTO_CMD_ARGS_OFFSET + AUTH_ARG_LEN)) {
+        return false;
+    }
+
+    const uint8_t *nonce = &req->payload[PROTO_CMD_ARGS_OFFSET];
+    const uint8_t *tag_b = &req->payload[PROTO_CMD_ARGS_OFFSET + AUTH_NONCE_LEN];
+
+    uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+    mac_input[0] = g_session_id;
+    memcpy(&mac_input[1], g_my_id, PROTO_DEVICE_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_authorized_master_id, PROTO_MASTER_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], nonce, AUTH_NONCE_LEN);
+
+    uint32_t expect = Slave_Mac32(mac_input, sizeof(mac_input));
+    uint32_t got = ((uint32_t)tag_b[0]) |
+                   ((uint32_t)tag_b[1] << 8) |
+                   ((uint32_t)tag_b[2] << 16) |
+                   ((uint32_t)tag_b[3] << 24);
+    if (expect != got) {
+        return false;
+    }
+
+    memcpy(g_session_nonce, nonce, AUTH_NONCE_LEN);
+    return true;
+}
+
+static uint8_t Slave_BuildPollDataBody(uint8_t *out, uint8_t out_size)
+{
+    uint8_t body_len = (uint8_t)sizeof(g_sensor_data);
+    uint8_t total = (uint8_t)(AUTH_ARG_LEN + body_len);
+    if ((out == NULL) || (out_size < total)) {
+        return 0U;
+    }
+
+    memcpy(out, g_session_nonce, AUTH_NONCE_LEN);
+
+    uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+    mac_input[0] = g_session_id;
+    memcpy(&mac_input[1], g_my_id, PROTO_DEVICE_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_authorized_master_id, PROTO_MASTER_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], g_session_nonce, AUTH_NONCE_LEN);
+    uint32_t tag = Slave_Mac32(mac_input, sizeof(mac_input));
+    out[4] = (uint8_t)(tag & 0xFFU);
+    out[5] = (uint8_t)((tag >> 8) & 0xFFU);
+    out[6] = (uint8_t)((tag >> 16) & 0xFFU);
+    out[7] = (uint8_t)((tag >> 24) & 0xFFU);
+
+    memcpy(&out[AUTH_ARG_LEN], g_sensor_data, body_len);
+    return total;
 }
 
 /* ========================================================================== */
@@ -271,6 +353,8 @@ static int Slave_HandleWakeUp(void)
 
     g_session_id     = assigned_sess;
     g_active_channel = assigned_channel;
+    g_last_rx_seq_valid = false;
+    memset(g_session_nonce, 0, sizeof(g_session_nonce));
 
     /* 9) Build and send wake-up ACK: echo DEVICE_ID + MASTER_ID +
      *    SESS + CHANNEL so Master can verify bilateral binding. */
@@ -341,6 +425,20 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
     switch (sub_cmd) {
     case CMD_POLL_REQ:
     {
+        if (!Slave_VerifyPollAuth(req)) {
+            uint8_t st = PROTO_STATUS_ERR_ID_MISMATCH;
+            slave_build_cmd_response(resp, CMD_DATA_ACK, &st, 1U);
+            break;
+        }
+
+        uint8_t auth_body[AUTH_ARG_LEN + sizeof(g_sensor_data)];
+        uint8_t auth_body_len = Slave_BuildPollDataBody(auth_body, sizeof(auth_body));
+        if (auth_body_len == 0U) {
+            uint8_t st = PROTO_STATUS_ERR_BUSY;
+            slave_build_cmd_response(resp, CMD_DATA_ACK, &st, 1U);
+            break;
+        }
+
         /* Respond with DATA-type frame:
          *   [DTYPE_ECG_DELTA, g_my_id, g_authorized_master_id, sensor...]
          * DEVICE_ID proves "I am the implant you woke up";
@@ -349,8 +447,8 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
         resp->payload_len = Proto_BuildDataPayload(MICS_DTYPE_ECG_DELTA,
                                                    g_my_id,
                                                    g_authorized_master_id,
-                                                   g_sensor_data,
-                                                   (uint8_t)sizeof(g_sensor_data),
+                                                   auth_body,
+                                                   auth_body_len,
                                                    resp->payload,
                                                    sizeof(resp->payload));
         break;
@@ -449,6 +547,11 @@ static int Slave_HandleMICSSession(void)
         if (!Proto_MatchSession(req_pkt.sess, g_session_id)) {
             continue;
         }
+        if (g_last_rx_seq_valid && !Proto_IsSeqNewer(req_pkt.seq, g_last_rx_seq)) {
+            continue; /* replay/duplicate/out-of-order */
+        }
+        g_last_rx_seq = req_pkt.seq;
+        g_last_rx_seq_valid = true;
 
         /* Only COMMAND frames are accepted from Master on 400 MHz */
         if (Proto_FCF_Type(req_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
@@ -496,6 +599,8 @@ static int Slave_HandleMICSSession(void)
     /* Invalidate session */
     g_session_id     = PROTO_SESS_UNASSIGNED;
     g_active_channel = PROTO_CHANNEL_UNASSIGNED;
+    g_last_rx_seq_valid = false;
+    memset(g_session_nonce, 0, sizeof(g_session_nonce));
     g_slave_pwr_trace.last_session_end_ms = HAL_GetTick();
     return 0;
 }
