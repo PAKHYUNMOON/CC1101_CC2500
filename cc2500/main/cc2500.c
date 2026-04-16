@@ -8,10 +8,12 @@
  * - Channels: 0..9  => ~2405.0, 2405.3, ... 2407.7 MHz
  * - Data rate: ~49.99 kbps
  * - RX BW: ~101.56 kHz
- * - Modulation: GFSK
- * - Deviation: ~20.63 kHz
+ * - Modulation: OOK (ASK) — WOR 감도/전력 최적화용
+ * - Deviation: N/A (DEVIATN은 OOK 모드에서 무시됨)
  * - Packet mode: variable length + CRC + append status
  * - GDO0: asserts when packet received with CRC OK
+ * - PA: OOK 는 PATABLE[0]=OFF('0'), PATABLE[1]=ON('1'),
+ *       FREND0.PA_POWER=1 로 2-엔트리 ramp 사용
  */
 
 static int16_t g_rssi_offset_db = CC2500_DEFAULT_RSSI_OFFSET_DB;
@@ -379,10 +381,10 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
         /* Modem */
         { CC2500_MDMCFG4,  0xCA }, /* RX BW ~101.56kHz, DRATE_E=10 */
         { CC2500_MDMCFG3,  0xF8 }, /* DRATE_M=248 -> ~49.99kbps */
-        { CC2500_MDMCFG2,  0x13 }, /* GFSK, 30/32 sync */
+        { CC2500_MDMCFG2,  0x33 }, /* OOK/ASK, 30/32 sync */
         { CC2500_MDMCFG1,  0x23 }, /* 4-byte preamble, CHANSPC_E=3 */
         { CC2500_MDMCFG0,  0x7A }, /* CHANSPC_M=122 -> ~299.93kHz */
-        { CC2500_DEVIATN,  0x35 }, /* ~20.63kHz */
+        { CC2500_DEVIATN,  0x00 }, /* OOK: DEVIATN 무시됨 (상위 nibble 0) */
 
         /* Main radio control */
         { CC2500_MCSM2,    0x07 },
@@ -403,7 +405,7 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
 
         /* Front-end / calibration / test */
         { CC2500_FREND1,   0x56 },
-        { CC2500_FREND0,   0x10 },
+        { CC2500_FREND0,   0x11 }, /* OOK: PA_POWER=1 -> PATABLE[0]=OFF, PATABLE[1]=ON */
         { CC2500_FSCAL3,   0xE9 },
         { CC2500_FSCAL2,   0x2A },
         { CC2500_FSCAL1,   0x00 },
@@ -418,7 +420,8 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
         { CC2500_TEST0,    0x09 }
     };
 
-    uint8_t pa = 0x12; /* low-power startup point */
+    /* OOK PA ramp: PATABLE[0]='0' state (OFF), PATABLE[1]='1' state (low-power setpoint) */
+    static const uint8_t pa_table[2] = { 0x00, 0x12 };
 
     if (CC2500_Reset(dev) != CC2500_OK) {
         return CC2500_ERR_TIMEOUT;
@@ -430,7 +433,7 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
         }
     }
 
-    if (cc2500_write_burst(dev, CC2500_PATABLE, &pa, 1U) != CC2500_OK) {
+    if (cc2500_write_burst(dev, CC2500_PATABLE, pa_table, (uint8_t)sizeof(pa_table)) != CC2500_OK) {
         return CC2500_ERR_SPI;
     }
 
@@ -484,13 +487,13 @@ CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
         { CC2500_FREQ1,    0x6E },
         { CC2500_FREQ0,    0x5C },
 
-        /* Modem: low data rate ~2.4 kbps for WOR sensitivity */
+        /* Modem: low data rate ~2.4 kbps OOK for WOR sensitivity/power */
         { CC2500_MDMCFG4,  0xF6 }, /* RX BW ~58.04 kHz, DRATE_E=6 */
         { CC2500_MDMCFG3,  0x83 }, /* DRATE_M=131 -> ~2.4 kbps */
-        { CC2500_MDMCFG2,  0x13 }, /* GFSK, 30/32 sync */
+        { CC2500_MDMCFG2,  0x33 }, /* OOK/ASK, 30/32 sync */
         { CC2500_MDMCFG1,  0x22 }, /* 4-byte preamble, CHANSPC_E=2 */
         { CC2500_MDMCFG0,  0xF8 }, /* channel spacing */
-        { CC2500_DEVIATN,  0x15 }, /* ~5.16 kHz deviation */
+        { CC2500_DEVIATN,  0x00 }, /* OOK: DEVIATN 무시됨 (상위 nibble 0) */
 
         /* Main radio control: RX->IDLE after pkt, auto-cal on IDLE->RX/TX */
         { CC2500_MCSM2,    0x07 },
@@ -513,7 +516,7 @@ CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
 
         /* Front-end / calibration / test */
         { CC2500_FREND1,   0x56 },
-        { CC2500_FREND0,   0x10 },
+        { CC2500_FREND0,   0x11 }, /* OOK: PA_POWER=1 -> PATABLE[0]=OFF, PATABLE[1]=ON */
         { CC2500_FSCAL3,   0xE9 },
         { CC2500_FSCAL2,   0x2A },
         { CC2500_FSCAL1,   0x00 },
@@ -528,7 +531,9 @@ CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
         { CC2500_TEST0,    0x09 }
     };
 
-    uint8_t pa = 0xFE; /* high power for wake-up reliability */
+    /* OOK PA ramp: PATABLE[0]='0' state (carrier OFF),
+     * PATABLE[1]='1' state (high power for wake-up reliability) */
+    static const uint8_t pa_table[2] = { 0x00, 0xFE };
 
     if (CC2500_Reset(dev) != CC2500_OK) {
         return CC2500_ERR_TIMEOUT;
@@ -540,7 +545,7 @@ CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
         }
     }
 
-    if (cc2500_write_burst(dev, CC2500_PATABLE, &pa, 1U) != CC2500_OK) {
+    if (cc2500_write_burst(dev, CC2500_PATABLE, pa_table, (uint8_t)sizeof(pa_table)) != CC2500_OK) {
         return CC2500_ERR_SPI;
     }
 
