@@ -34,6 +34,9 @@
 #define AUTH_NONCE_LEN 4U
 #define AUTH_TAG_LEN   4U
 #define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
+#define STREAM_CFG_SUBCMD 0x01U
+#define STREAM_USE_OPTIONAL_NACK 0U
+#define STREAM_NACK_MIN_GAP 2U
 
 /* ---------- hardware handles ---------- */
 static CC1101_HandleTypeDef g_cc1101;
@@ -65,6 +68,8 @@ static uint8_t g_next_sess      = 1U;   /* rolling session ID generator */
 static uint8_t g_last_rx_seq = 0U;
 static bool    g_last_rx_seq_valid = false;
 static uint8_t g_poll_nonce[AUTH_NONCE_LEN] = {0};
+static uint8_t g_stream_interval_ms = 20U;
+static uint8_t g_stream_frame_count = 4U;
 
 static const uint8_t g_auth_key[16] = {
     0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
@@ -91,11 +96,15 @@ static int  Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len);
 static int  Master_WriteToImplant(const uint8_t *data, uint8_t len);
 static int  Master_SendSleepCommand(void);
 static int  Master_CommunicationSession(void);
+static int  Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count);
+static int  Master_ConfigureStreamViaDataWrite(uint8_t interval_ms, uint8_t frame_count);
+static int  Master_SendStreamNack(uint8_t missing_from_seq);
 static CC1101_Status Master_TxLBT_SameChannel(const uint8_t *tx_buf,
                                               uint8_t tx_len);
 static uint32_t Master_Mac32(const uint8_t *buf, uint8_t len);
 static void Master_BuildPollAuthArgs(uint8_t sess, uint8_t out[AUTH_ARG_LEN]);
 static bool Master_VerifyPollDataAuth(const Proto_Packet *pkt, uint8_t body_off);
+static bool Master_VerifyStreamDataAuth(const Proto_Packet *pkt, uint8_t body_off);
 
 /* ========================================================================== */
 /* Hardware initialization                                                     */
@@ -218,6 +227,171 @@ static bool Master_VerifyPollDataAuth(const Proto_Packet *pkt, uint8_t body_off)
                    ((uint32_t)tag_b[2] << 16) |
                    ((uint32_t)tag_b[3] << 24);
     return expect == got;
+}
+
+static bool Master_VerifyStreamDataAuth(const Proto_Packet *pkt, uint8_t body_off)
+{
+    return Master_VerifyPollDataAuth(pkt, body_off);
+}
+
+static int Master_SendStreamNack(uint8_t missing_from_seq)
+{
+    uint8_t nack_args[1] = { missing_from_seq };
+    Proto_Packet nack_pkt;
+    uint8_t tx_buf[CC1101_PKT_MAX_LEN];
+
+    nack_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
+    nack_pkt.seq  = g_seq++;
+    nack_pkt.sess = g_session_id;
+    nack_pkt.payload_len = Proto_BuildCommandPayload(CMD_STREAM_NACK,
+                                                     g_target_id,
+                                                     g_master_id,
+                                                     nack_args, (uint8_t)sizeof(nack_args),
+                                                     nack_pkt.payload,
+                                                     sizeof(nack_pkt.payload));
+    if (nack_pkt.payload_len == 0U) {
+        return -1;
+    }
+    uint8_t tx_len = Proto_BuildPacket(&nack_pkt, tx_buf, sizeof(tx_buf));
+    if (tx_len == 0U) {
+        return -1;
+    }
+    return (Master_TxLBT_SameChannel(tx_buf, tx_len) == CC1101_OK) ? 0 : -2;
+}
+
+static int Master_ConfigureStreamViaDataWrite(uint8_t interval_ms, uint8_t frame_count)
+{
+    uint8_t cfg[3];
+    cfg[0] = STREAM_CFG_SUBCMD;
+    cfg[1] = interval_ms;
+    cfg[2] = frame_count;
+    return Master_WriteToImplant(cfg, (uint8_t)sizeof(cfg));
+}
+
+static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
+{
+    if (frame_count == 0U) {
+        return 0;
+    }
+
+    uint8_t start_args[AUTH_ARG_LEN + 2U];
+    Master_BuildPollAuthArgs(g_session_id, start_args);
+    start_args[AUTH_ARG_LEN] = interval_ms;
+    start_args[AUTH_ARG_LEN + 1U] = frame_count;
+
+    Proto_Packet start_pkt;
+    uint8_t tx_buf[CC1101_PKT_MAX_LEN];
+    uint8_t rx_buf[CC1101_PKT_MAX_LEN];
+    uint8_t rx_len = 0U;
+
+    start_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
+    start_pkt.seq  = g_seq++;
+    start_pkt.sess = g_session_id;
+    start_pkt.payload_len = Proto_BuildCommandPayload(CMD_STREAM_START,
+                                                      g_target_id,
+                                                      g_master_id,
+                                                      start_args, (uint8_t)sizeof(start_args),
+                                                      start_pkt.payload,
+                                                      sizeof(start_pkt.payload));
+    if (start_pkt.payload_len == 0U) {
+        return -1;
+    }
+    uint8_t tx_len = Proto_BuildPacket(&start_pkt, tx_buf, sizeof(tx_buf));
+    if (tx_len == 0U) {
+        return -1;
+    }
+    if (Master_TxLBT_SameChannel(tx_buf, tx_len) != CC1101_OK) {
+        return -2;
+    }
+
+    /* Wait command ACK for stream start */
+    if (CC1101_WaitAndReadPacket(&g_cc1101, g_active_channel,
+                                 rx_buf, &rx_len, sizeof(rx_buf),
+                                 PROTO_MICS_RESP_TIMEOUT_MS) != CC1101_OK) {
+        return -3;
+    }
+
+    Proto_Packet ack;
+    if (Proto_ParsePacket(rx_buf, rx_len, &ack) < 0) {
+        return -4;
+    }
+    if (!Proto_MatchSession(ack.sess, g_session_id)) {
+        return -5;
+    }
+    if (g_last_rx_seq_valid && !Proto_IsSeqNewer(ack.seq, g_last_rx_seq)) {
+        return -6;
+    }
+    g_last_rx_seq = ack.seq;
+    g_last_rx_seq_valid = true;
+
+    if (Proto_FCF_Type(ack.fcf) != MICS_FCF_TYPE_COMMAND) {
+        return -7;
+    }
+    if (!Proto_VerifyPayloadDeviceID(&ack, PROTO_CMD_DEVID_OFFSET, g_target_id) ||
+        !Proto_VerifyPayloadMasterID(&ack, PROTO_CMD_MASTERID_OFFSET, g_master_id)) {
+        return -8;
+    }
+    if (ack.payload_len < (PROTO_CMD_ARGS_OFFSET + 1U) ||
+        ack.payload[PROTO_CMD_SUBCMD_OFFSET] != CMD_STREAM_ACK ||
+        ack.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+        return -9;
+    }
+
+    /* Receive pushed stream DATA frames */
+    uint8_t received = 0U;
+    bool stream_seq_valid = false;
+    uint8_t last_stream_seq = 0U;
+    while (received < frame_count) {
+        if (CC1101_WaitAndReadPacket(&g_cc1101, g_active_channel,
+                                     rx_buf, &rx_len, sizeof(rx_buf),
+                                     PROTO_MICS_RESP_TIMEOUT_MS) != CC1101_OK) {
+            return -10;
+        }
+        Proto_Packet data_pkt;
+        if (Proto_ParsePacket(rx_buf, rx_len, &data_pkt) < 0) {
+            continue;
+        }
+        if (!Proto_MatchSession(data_pkt.sess, g_session_id)) {
+            continue;
+        }
+        if (g_last_rx_seq_valid && !Proto_IsSeqNewer(data_pkt.seq, g_last_rx_seq)) {
+            continue;
+        }
+        g_last_rx_seq = data_pkt.seq;
+        g_last_rx_seq_valid = true;
+
+        if (Proto_FCF_Type(data_pkt.fcf) != MICS_FCF_TYPE_DATA) {
+            continue;
+        }
+        if (!Proto_VerifyPayloadDeviceID(&data_pkt, PROTO_DATA_DEVID_OFFSET, g_target_id) ||
+            !Proto_VerifyPayloadMasterID(&data_pkt, PROTO_DATA_MASTERID_OFFSET, g_master_id)) {
+            continue;
+        }
+        if (!Master_VerifyStreamDataAuth(&data_pkt, PROTO_DATA_BODY_OFFSET)) {
+            continue;
+        }
+        /* DATA body: NONCE(4) + TAG(4) + stream_seq(1) + sensor... */
+        if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 1U)) {
+            continue;
+        }
+        uint8_t stream_seq = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN];
+        if (stream_seq_valid) {
+            uint8_t expected = (uint8_t)(last_stream_seq + 1U);
+            if (stream_seq != expected) {
+#if STREAM_USE_OPTIONAL_NACK
+                uint8_t gap = (uint8_t)(stream_seq - expected);
+                if (gap >= STREAM_NACK_MIN_GAP) {
+                    (void)Master_SendStreamNack(expected);
+                }
+#endif
+            }
+        }
+        last_stream_seq = stream_seq;
+        stream_seq_valid = true;
+        received++;
+    }
+
+    return 0;
 }
 
 /* ========================================================================== */
@@ -672,6 +846,12 @@ static int Master_CommunicationSession(void)
 
         /* Process received data (application-specific) */
         /* ... */
+
+        /* Runtime stream control path:
+         * 1) push stream config via DATA_WRITE
+         * 2) trigger stream start with configured values */
+        (void)Master_ConfigureStreamViaDataWrite(g_stream_interval_ms, g_stream_frame_count);
+        (void)Master_StreamFromImplant(g_stream_interval_ms, g_stream_frame_count);
 
         /* Phase 3: End session - send implant back to sleep */
         Master_SendSleepCommand();
