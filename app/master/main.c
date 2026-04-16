@@ -1,14 +1,20 @@
 /*
  * Master (Programmer) - External Device Application
  *
- * Communication flow:
- *   1. CC2500 sends wake-up beacon (2.4 GHz) with DEVICE_ID+SESS in payload
- *   2. CC2500 waits for wake-up ACK (payload echoes DEVICE_ID+SESS)
- *   3. CC1101 performs LBT to find a free MICS channel (400 MHz)
- *   4. CC1101 sends POLL/DATA commands tagged with SESS; channel agility
- *   5. CC1101 receives responses filtered by SESS
- *   6. CC1101 sends SLEEP command to implant
- *   7. Both radios return to idle/sleep
+ * Communication flow (LBT-first, same-channel retry):
+ *   0. (internal) CC1101 runs LBT over MICS ch 0..9, picks a free channel N
+ *   1. CC2500 sends wake-up beacon (2.4 GHz) carrying
+ *      DEVICE_ID + MASTER_ID + SESS + CHANNEL=N
+ *   2. CC2500 waits for wake-up ACK (Slave echoes DEVICE_ID + MASTER_ID +
+ *      SESS + CHANNEL)
+ *   3. CC1101 sends POLL / DATA commands on channel N with same-channel LBT
+ *      retries (never hops - Slave is camped on N)
+ *   4. CC1101 receives responses filtered by SESS + DEVICE_ID + MASTER_ID
+ *   5. CC1101 sends SLEEP command to implant
+ *   6. Both radios return to idle/sleep
+ *
+ * If same-channel LBT fails despite retries, the outer session-restart loop
+ * re-runs step 0 and picks a new free channel.
  *
  * MCU: STM32U575 Q-series
  * Radios: CC2500 (2.4 GHz wake-up), CC1101 (400 MHz MICS data)
@@ -30,12 +36,36 @@ extern SPI_HandleTypeDef hspi1;  /* CC1101 SPI */
 extern SPI_HandleTypeDef hspi2;  /* CC2500 SPI */
 extern RTC_HandleTypeDef hrtc;
 
+/* ---------- identity (factory-provisioned) ----------
+ * g_master_id   : this Master's 4-byte authenticator. Sent on every beacon /
+ *                 COMMAND / DATA frame. Slaves are paired to a specific
+ *                 g_master_id at factory and reject frames that do not carry
+ *                 the expected ID. This is a pre-shared identifier, NOT a
+ *                 cryptographic key.
+ * g_target_id   : DEVICE_ID of the implant we currently talk to.
+ */
+static const uint8_t g_master_id[PROTO_MASTER_ID_LEN] =
+    {0xAA, 0xBB, 0xCC, 0xDD};
+static uint8_t g_target_id[PROTO_DEVICE_ID_LEN] = {0x00, 0x00, 0x00, 0x01};
+
 /* ---------- session state ---------- */
 static uint8_t g_seq = 0U;
-static uint8_t g_target_id[PROTO_DEVICE_ID_LEN] = {0x00, 0x00, 0x00, 0x01};
 static uint8_t g_active_channel = 0U;
 static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED;
 static uint8_t g_next_sess      = 1U;   /* rolling session ID generator */
+
+/* ---------- LBT retry policy (Patch B) ----------
+ * Once Master has pre-selected a channel via LBT and advertised it in the
+ * 2.4 GHz wake-up beacon, the Slave is expected to reply on that exact
+ * channel. If the channel becomes busy (another MICS user enters) we must
+ * NOT hop - that would desync the Slave. Instead we retry CCA on the same
+ * channel a bounded number of times with a short random back-off. If CCA
+ * keeps failing we abort the TX and let the outer session-restart loop
+ * re-run wake-up (with a fresh LBT channel selection).
+ */
+#define MASTER_SAME_CH_RETRIES      3U   /* total CCA attempts per TX */
+#define MASTER_SAME_CH_BACKOFF_MS   5U   /* base back-off between CCA attempts */
+#define MASTER_SESSION_RESTARTS     2U   /* outer wake-up retries on CCA fail */
 
 /* ---------- forward declarations ---------- */
 static void Master_InitHardware(void);
@@ -44,6 +74,8 @@ static int  Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len);
 static int  Master_WriteToImplant(const uint8_t *data, uint8_t len);
 static int  Master_SendSleepCommand(void);
 static int  Master_CommunicationSession(void);
+static CC1101_Status Master_TxLBT_SameChannel(const uint8_t *tx_buf,
+                                              uint8_t tx_len);
 
 /* ========================================================================== */
 /* Hardware initialization                                                     */
@@ -105,6 +137,42 @@ static uint8_t Master_AllocateSession(void)
 }
 
 /* ========================================================================== */
+/* Same-channel LBT helper (Patch B)                                            */
+/*                                                                              */
+/* Retries CCA on g_active_channel up to MASTER_SAME_CH_RETRIES times with a    */
+/* small back-off between attempts. Unlike CC1101_SendPacketLBT_Agile this      */
+/* NEVER hops to a different channel, so the Slave stays in sync with the       */
+/* channel it was told to camp on in the wake-up beacon.                        */
+/* Returns CC1101_OK on successful TX, CC1101_ERR_CCA if every attempt failed.  */
+/* ========================================================================== */
+static CC1101_Status Master_TxLBT_SameChannel(const uint8_t *tx_buf,
+                                              uint8_t tx_len)
+{
+    CC1101_Status st = CC1101_ERR_CCA;
+    for (uint8_t attempt = 0U; attempt < MASTER_SAME_CH_RETRIES; attempt++) {
+        st = CC1101_SendPacketLBT(&g_cc1101,
+                                  g_active_channel,
+                                  tx_buf, tx_len,
+                                  CC1101_MICS_LBT_THRESHOLD_DBM,
+                                  CC1101_MICS_LBT_LISTEN_MS,
+                                  200U);
+        if (st == CC1101_OK) {
+            return CC1101_OK;
+        }
+        if (st != CC1101_ERR_CCA) {
+            /* Non-CCA failure (SPI / HW) - retry won't help */
+            return st;
+        }
+        /* Pseudo-random back-off: mix seq counter with attempt index to
+         * de-correlate colliding Masters. Bounded: [MASTER_SAME_CH_BACKOFF_MS
+         * .. MASTER_SAME_CH_BACKOFF_MS + 7]. */
+        uint32_t jitter = ((uint32_t)g_seq + attempt) & 0x07U;
+        HAL_Delay(MASTER_SAME_CH_BACKOFF_MS + jitter);
+    }
+    return st;   /* CC1101_ERR_CCA */
+}
+
+/* ========================================================================== */
 /* Phase 1: Wake-up via CC2500 (2.4 GHz)                                      */
 /* ========================================================================== */
 
@@ -134,9 +202,10 @@ static int Master_WakeUpImplant(void)
      *    PAYLOAD[0]    = DTYPE_COMMAND
      *    PAYLOAD[1]    = CMD_WAKEUP_REQ
      *    PAYLOAD[2..5] = target DEVICE_ID
-     *    PAYLOAD[6]    = proposed SESS
-     *    PAYLOAD[7]    = assigned MICS channel (from LBT)
-     *    PAYLOAD[8]    = flags
+     *    PAYLOAD[6..9] = MASTER_ID (authenticator)
+     *    PAYLOAD[10]   = proposed SESS
+     *    PAYLOAD[11]   = assigned MICS channel (from LBT)
+     *    PAYLOAD[12]   = flags
      */
     Proto_Packet beacon_pkt;
     beacon_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
@@ -144,6 +213,7 @@ static int Master_WakeUpImplant(void)
     beacon_pkt.sess = PROTO_SESS_BROADCAST;
     beacon_pkt.payload_len = Proto_BuildBeaconPayload(CMD_WAKEUP_REQ,
                                                       g_target_id,
+                                                      g_master_id,
                                                       proposed_sess,
                                                       g_active_channel,
                                                       0U,
@@ -178,10 +248,11 @@ static int Master_WakeUpImplant(void)
 
     /* 6) Parse and verify ACK:
      *    - FCF type = COMMAND
-     *    - payload[1] = CMD_WAKEUP_ACK
+     *    - payload[1]    = CMD_WAKEUP_ACK
      *    - payload[2..5] = our target DEVICE_ID
-     *    - payload[6]   = echoed SESS (must match proposed_sess)
-     *    - payload[7]   = echoed CHANNEL (must match g_active_channel)
+     *    - payload[6..9] = echoed MASTER_ID (must match g_master_id)
+     *    - payload[10]   = echoed SESS (must match proposed_sess)
+     *    - payload[11]   = echoed CHANNEL (must match g_active_channel)
      */
     Proto_Packet ack_pkt;
     if (Proto_ParsePacket(rx_buf, rx_len, &ack_pkt) < 0) {
@@ -200,11 +271,18 @@ static int Master_WakeUpImplant(void)
                              g_target_id)) {
         return -9;
     }
-    if (ack_pkt.payload[PROTO_BEACON_SESS_OFFSET] != proposed_sess) {
+    /* MASTER_ID echo proves the Slave really received OUR wake-up beacon
+     * (and not a concurrent Master that happens to use the same DEVICE_ID). */
+    if (!Proto_VerifyPayloadMasterID(&ack_pkt,
+                                     PROTO_BEACON_MASTERID_OFFSET,
+                                     g_master_id)) {
         return -10;
     }
+    if (ack_pkt.payload[PROTO_BEACON_SESS_OFFSET] != proposed_sess) {
+        return -11;
+    }
     if (ack_pkt.payload[PROTO_BEACON_CHANNEL_OFFSET] != g_active_channel) {
-        return -11;  /* Slave didn't acknowledge the assigned channel */
+        return -12;  /* Slave didn't acknowledge the assigned channel */
     }
 
     /* 7) Session established */
@@ -226,15 +304,17 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     /* Build POLL request:
      *   FCF  = COMMAND | ACK_REQ
      *   SESS = established session
-     *   payload = [DTYPE_COMMAND, CMD_POLL_REQ, DEVICE_ID[4]]
-     *   The DEVICE_ID proves to Slave that this Master knows the identity
-     *   handed off during the 2.4 GHz wake-up handshake.
+     *   payload = [DTYPE_COMMAND, CMD_POLL_REQ, DEVICE_ID[4], MASTER_ID[4]]
+     *   DEVICE_ID + MASTER_ID jointly prove to Slave that this Master is the
+     *   same authenticated peer that handed off identity during the 2.4 GHz
+     *   wake-up handshake.
      */
     poll_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
     poll_pkt.seq  = g_seq++;
     poll_pkt.sess = g_session_id;
     poll_pkt.payload_len = Proto_BuildCommandPayload(CMD_POLL_REQ,
                                                      g_target_id,
+                                                     g_master_id,
                                                      NULL, 0U,
                                                      poll_pkt.payload,
                                                      sizeof(poll_pkt.payload));
@@ -247,14 +327,9 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
         return -1;
     }
 
-    /* Send with LBT + channel agility */
-    CC1101_Status st = CC1101_SendPacketLBT_Agile(&g_cc1101,
-                                                   tx_buf, tx_len,
-                                                   CC1101_MICS_LBT_THRESHOLD_DBM,
-                                                   CC1101_MICS_LBT_LISTEN_MS,
-                                                   200U,
-                                                   CC1101_MICS_MAX_LBT_RETRIES,
-                                                   &g_active_channel);
+    /* Same-channel LBT: retry CCA on the pre-announced channel, do NOT hop.
+     * If every retry fails, caller restarts the session (new LBT channel). */
+    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
     if (st != CC1101_OK) {
         return -2;
     }
@@ -278,16 +353,20 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
         return -5;
     }
 
-    /* Verify DEVICE_ID in payload - must match the Slave we woke up on 2.4 GHz */
+    /* Verify DEVICE_ID + MASTER_ID in payload.
+     * Triple-check (SESS + DEVICE_ID + MASTER_ID) confirms the response
+     * originates from the Slave we woke up AND is bound to this Master. */
     uint8_t ftype = Proto_FCF_Type(resp_pkt.fcf);
-    uint8_t devid_off, body_off;
+    uint8_t devid_off, masterid_off, body_off;
 
     if (ftype == MICS_FCF_TYPE_DATA) {
-        devid_off = PROTO_DATA_DEVID_OFFSET;
-        body_off  = PROTO_DATA_BODY_OFFSET;
+        devid_off    = PROTO_DATA_DEVID_OFFSET;
+        masterid_off = PROTO_DATA_MASTERID_OFFSET;
+        body_off     = PROTO_DATA_BODY_OFFSET;
     } else if (ftype == MICS_FCF_TYPE_COMMAND) {
-        devid_off = PROTO_CMD_DEVID_OFFSET;
-        body_off  = PROTO_CMD_ARGS_OFFSET;
+        devid_off    = PROTO_CMD_DEVID_OFFSET;
+        masterid_off = PROTO_CMD_MASTERID_OFFSET;
+        body_off     = PROTO_CMD_ARGS_OFFSET;
     } else {
         return -6;
     }
@@ -295,10 +374,13 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     if (!Proto_VerifyPayloadDeviceID(&resp_pkt, devid_off, g_target_id)) {
         return -7;  /* Device ID mismatch - possible spoofer or wrong Slave */
     }
+    if (!Proto_VerifyPayloadMasterID(&resp_pkt, masterid_off, g_master_id)) {
+        return -8;  /* Slave is echoing a different Master's ID - reject */
+    }
 
     /* Copy application body to caller */
     if (resp_pkt.payload_len < body_off) {
-        return -8;
+        return -9;
     }
     if ((resp_buf != NULL) && (resp_len != NULL)) {
         uint8_t n = (uint8_t)(resp_pkt.payload_len - body_off);
@@ -316,18 +398,19 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     uint8_t rx_buf[CC1101_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    /* Command payload overhead = DTYPE + CMD + DEVID[4] = 6 bytes */
+    /* Command payload overhead = DTYPE + SUBCMD + DEVID[4] + MASTERID[4] = 10 B */
     if ((data == NULL) || (len == 0U) ||
         (len > (PROTO_MAX_PAYLOAD - PROTO_CMD_HEADER_LEN))) {
         return -1;
     }
 
-    /* Build DATA_WRITE packet with DEVICE_ID handoff */
+    /* Build DATA_WRITE packet with DEVICE_ID + MASTER_ID handoff */
     write_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
     write_pkt.seq  = g_seq++;
     write_pkt.sess = g_session_id;
     write_pkt.payload_len = Proto_BuildCommandPayload(CMD_DATA_WRITE,
                                                       g_target_id,
+                                                      g_master_id,
                                                       data, len,
                                                       write_pkt.payload,
                                                       sizeof(write_pkt.payload));
@@ -340,13 +423,8 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
         return -2;
     }
 
-    /* Send with LBT on current active channel */
-    CC1101_Status st = CC1101_SendPacketLBT(&g_cc1101,
-                                            g_active_channel,
-                                            tx_buf, tx_len,
-                                            CC1101_MICS_LBT_THRESHOLD_DBM,
-                                            CC1101_MICS_LBT_LISTEN_MS,
-                                            200U);
+    /* Same-channel LBT retry (never hop - Slave is camped on this channel) */
+    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
     if (st != CC1101_OK) {
         return -3;
     }
@@ -371,19 +449,23 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     if (Proto_FCF_Type(ack_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
         return -7;
     }
-    /* Verify DEVICE_ID handoff in ACK */
+    /* Verify DEVICE_ID + MASTER_ID handoff in ACK */
     if (!Proto_VerifyPayloadDeviceID(&ack_pkt, PROTO_CMD_DEVID_OFFSET,
                                      g_target_id)) {
         return -8;
     }
-    if (ack_pkt.payload_len < (PROTO_CMD_ARGS_OFFSET + 1U)) {
+    if (!Proto_VerifyPayloadMasterID(&ack_pkt, PROTO_CMD_MASTERID_OFFSET,
+                                     g_master_id)) {
         return -9;
     }
-    if (ack_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] != CMD_DATA_ACK) {
+    if (ack_pkt.payload_len < (PROTO_CMD_ARGS_OFFSET + 1U)) {
         return -10;
     }
-    if (ack_pkt.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+    if (ack_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] != CMD_DATA_ACK) {
         return -11;
+    }
+    if (ack_pkt.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+        return -12;
     }
 
     return 0;
@@ -405,6 +487,7 @@ static int Master_SendSleepCommand(void)
     sleep_pkt.sess = g_session_id;
     sleep_pkt.payload_len = Proto_BuildCommandPayload(CMD_SLEEP_CMD,
                                                       g_target_id,
+                                                      g_master_id,
                                                       NULL, 0U,
                                                       sleep_pkt.payload,
                                                       sizeof(sleep_pkt.payload));
@@ -417,12 +500,8 @@ static int Master_SendSleepCommand(void)
         return -1;
     }
 
-    CC1101_Status st = CC1101_SendPacketLBT(&g_cc1101,
-                                            g_active_channel,
-                                            tx_buf, tx_len,
-                                            CC1101_MICS_LBT_THRESHOLD_DBM,
-                                            CC1101_MICS_LBT_LISTEN_MS,
-                                            200U);
+    /* Same-channel LBT retry (no hop) */
+    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
     if (st != CC1101_OK) {
         return -2;
     }
@@ -448,36 +527,54 @@ static int Master_SendSleepCommand(void)
 
 static int Master_CommunicationSession(void)
 {
-    int rc;
-
-    /* Phase 1: Wake up implant via 2.4 GHz */
-    rc = Master_WakeUpImplant();
-    if (rc != 0) {
-        return rc;
-    }
-
-    /* Phase 2: Poll data via 400 MHz MICS */
+    int rc = -1;
     uint8_t data_buf[PROTO_MAX_PAYLOAD];
     uint8_t data_len = 0U;
 
-    rc = Master_PollImplantData(data_buf, &data_len);
-    if (rc != 0) {
-        /* Try to send sleep command even if poll failed */
+    /* Outer session-restart loop (Patch B).
+     *
+     * If same-channel LBT keeps failing on the MICS channel we announced
+     * during wake-up (another user has occupied it after our CCA), the
+     * Slave is camped on a dead channel. Re-run wake-up from scratch:
+     * LBT will pick a NEW free channel, the beacon will advertise it,
+     * and the Slave will retune. Bounded by MASTER_SESSION_RESTARTS.
+     */
+    for (uint8_t attempt = 0U; attempt <= MASTER_SESSION_RESTARTS; attempt++) {
+        /* Phase 1: Wake up implant via 2.4 GHz (with fresh LBT each pass) */
+        rc = Master_WakeUpImplant();
+        if (rc != 0) {
+            continue; /* try again from wake-up - Slave may have missed beacon */
+        }
+
+        /* Phase 2: Poll data via 400 MHz MICS */
+        rc = Master_PollImplantData(data_buf, &data_len);
+        if (rc == -2) {
+            /* CCA failure on announced channel: the channel was occupied
+             * after our LBT. Restart the session so we re-run LBT and
+             * pick a different channel. Slave will session-timeout or be
+             * re-woken with the new channel. */
+            continue;
+        }
+        if (rc != 0) {
+            /* Non-CCA failure (parse, auth, timeout) - end session cleanly */
+            Master_SendSleepCommand();
+            break;
+        }
+
+        /* Process received data (application-specific) */
+        /* ... */
+
+        /* Phase 3: End session - send implant back to sleep */
         Master_SendSleepCommand();
-        return rc;
+        rc = 0;
+        break;
     }
 
-    /* Process received data (application-specific) */
-    /* ... */
-
-    /* Phase 3: End session - send implant back to sleep */
-    Master_SendSleepCommand();
-
-    /* Put radios to sleep */
+    /* Put radios to sleep regardless of outcome */
     CC1101_EnterSleep(&g_cc1101);
     CC2500_EnterSleep(&g_cc2500);
 
-    return 0;
+    return rc;
 }
 
 /* ========================================================================== */
