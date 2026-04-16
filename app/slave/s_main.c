@@ -29,6 +29,7 @@
 #define AUTH_NONCE_LEN 4U
 #define AUTH_TAG_LEN   4U
 #define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
+#define STREAM_CFG_SUBCMD 0x01U
 
 /* ---------- low-power tuning knobs ---------- */
 #define SLAVE_RTC_WAKEUP_INTERVAL_S   300U  /* raise to reduce periodic wakeups */
@@ -86,6 +87,11 @@ static uint8_t g_active_channel = PROTO_CHANNEL_UNASSIGNED; /* MICS channel carr
 static uint8_t g_last_rx_seq = 0U;
 static bool    g_last_rx_seq_valid = false;
 static uint8_t g_session_nonce[AUTH_NONCE_LEN] = {0};
+static bool    g_stream_enabled = false;
+static uint8_t g_stream_interval_ms = 20U;
+static uint8_t g_stream_remaining_frames = 0U;
+static uint8_t g_stream_seq = 0U;
+static uint32_t g_last_stream_tx_tick = 0U;
 
 static const uint8_t g_auth_key[16] = {
     0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
@@ -110,6 +116,8 @@ static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel);
 static uint32_t Slave_Mac32(const uint8_t *buf, uint8_t len);
 static bool Slave_VerifyPollAuth(const Proto_Packet *req);
 static uint8_t Slave_BuildPollDataBody(uint8_t *out, uint8_t out_size);
+static bool Slave_VerifyCmdAuthAndStoreNonce(const Proto_Packet *req);
+static uint8_t Slave_BuildStreamDataBody(uint8_t *out, uint8_t out_size);
 
 /* ========================================================================== */
 /* EXTI callback - CC2500 GDO0 wake-up interrupt                              */
@@ -179,7 +187,7 @@ static uint32_t Slave_Mac32(const uint8_t *buf, uint8_t len)
     return h;
 }
 
-static bool Slave_VerifyPollAuth(const Proto_Packet *req)
+static bool Slave_VerifyCmdAuthAndStoreNonce(const Proto_Packet *req)
 {
     if (req->payload_len < (uint8_t)(PROTO_CMD_ARGS_OFFSET + AUTH_ARG_LEN)) {
         return false;
@@ -229,6 +237,33 @@ static uint8_t Slave_BuildPollDataBody(uint8_t *out, uint8_t out_size)
     out[7] = (uint8_t)((tag >> 24) & 0xFFU);
 
     memcpy(&out[AUTH_ARG_LEN], g_sensor_data, body_len);
+    return total;
+}
+
+static uint8_t Slave_BuildStreamDataBody(uint8_t *out, uint8_t out_size)
+{
+    const uint8_t stream_meta_len = 1U; /* stream_seq */
+    uint8_t body_len = (uint8_t)sizeof(g_sensor_data);
+    uint8_t total = (uint8_t)(AUTH_ARG_LEN + stream_meta_len + body_len);
+    if ((out == NULL) || (out_size < total)) {
+        return 0U;
+    }
+
+    memcpy(out, g_session_nonce, AUTH_NONCE_LEN);
+
+    uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+    mac_input[0] = g_session_id;
+    memcpy(&mac_input[1], g_my_id, PROTO_DEVICE_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_authorized_master_id, PROTO_MASTER_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], g_session_nonce, AUTH_NONCE_LEN);
+    uint32_t tag = Slave_Mac32(mac_input, sizeof(mac_input));
+    out[4] = (uint8_t)(tag & 0xFFU);
+    out[5] = (uint8_t)((tag >> 8) & 0xFFU);
+    out[6] = (uint8_t)((tag >> 16) & 0xFFU);
+    out[7] = (uint8_t)((tag >> 24) & 0xFFU);
+
+    out[AUTH_ARG_LEN] = g_stream_seq++;
+    memcpy(&out[AUTH_ARG_LEN + stream_meta_len], g_sensor_data, body_len);
     return total;
 }
 
@@ -425,7 +460,7 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
     switch (sub_cmd) {
     case CMD_POLL_REQ:
     {
-        if (!Slave_VerifyPollAuth(req)) {
+        if (!Slave_VerifyCmdAuthAndStoreNonce(req)) {
             uint8_t st = PROTO_STATUS_ERR_ID_MISMATCH;
             slave_build_cmd_response(resp, CMD_DATA_ACK, &st, 1U);
             break;
@@ -454,12 +489,70 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
         break;
     }
 
+    case CMD_STREAM_START:
+    {
+        if (!Slave_VerifyCmdAuthAndStoreNonce(req)) {
+            uint8_t st = PROTO_STATUS_ERR_ID_MISMATCH;
+            slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
+            break;
+        }
+
+        if (req->payload_len < (uint8_t)(PROTO_CMD_ARGS_OFFSET + AUTH_ARG_LEN + 2U)) {
+            uint8_t st = PROTO_STATUS_ERR_UNKNOWN_CMD;
+            slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
+            break;
+        }
+
+        g_stream_interval_ms = req->payload[PROTO_CMD_ARGS_OFFSET + AUTH_ARG_LEN];
+        g_stream_remaining_frames = req->payload[PROTO_CMD_ARGS_OFFSET + AUTH_ARG_LEN + 1U];
+        if (g_stream_interval_ms == 0U) {
+            g_stream_interval_ms = 20U;
+        }
+        g_stream_enabled = (g_stream_remaining_frames > 0U);
+        g_stream_seq = 0U;
+        g_last_stream_tx_tick = HAL_GetTick();
+
+        uint8_t st = PROTO_STATUS_OK;
+        slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
+        break;
+    }
+
+    case CMD_STREAM_STOP:
+    {
+        g_stream_enabled = false;
+        g_stream_remaining_frames = 0U;
+        uint8_t st = PROTO_STATUS_OK;
+        slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
+        break;
+    }
+
+    case CMD_STREAM_NACK:
+    {
+        /* Optional/low-frequency path: default ACK-only profile keeps
+         * behavior simple and power-efficient. We only acknowledge receipt. */
+        uint8_t st = PROTO_STATUS_OK;
+        slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
+        break;
+    }
+
     case CMD_DATA_WRITE:
     {
-        /* Write args start at payload[PROTO_CMD_ARGS_OFFSET] */
-        uint8_t status = (req->payload_len > PROTO_CMD_ARGS_OFFSET)
-                         ? PROTO_STATUS_OK
-                         : PROTO_STATUS_ERR_UNKNOWN_CMD;
+        /* DATA_WRITE args profile (runtime stream config):
+         *   args[0] = STREAM_CFG_SUBCMD (0x01)
+         *   args[1] = interval_ms
+         *   args[2] = frame_count
+         */
+        uint8_t status = PROTO_STATUS_ERR_UNKNOWN_CMD;
+        if (req->payload_len >= (uint8_t)(PROTO_CMD_ARGS_OFFSET + 3U)) {
+            const uint8_t *args = &req->payload[PROTO_CMD_ARGS_OFFSET];
+            if (args[0] == STREAM_CFG_SUBCMD) {
+                uint8_t iv = args[1];
+                uint8_t fc = args[2];
+                g_stream_interval_ms = (iv == 0U) ? 20U : iv;
+                g_stream_remaining_frames = fc;
+                status = PROTO_STATUS_OK;
+            }
+        }
         slave_build_cmd_response(resp, CMD_DATA_ACK, &status, 1U);
         break;
     }
@@ -536,6 +629,34 @@ static int Slave_HandleMICSSession(void)
                                                     sizeof(rx_buf),
                                                     SLAVE_MICS_RX_WINDOW_MS);
         if (st != CC1101_OK) {
+            if (g_stream_enabled &&
+                ((HAL_GetTick() - g_last_stream_tx_tick) >= g_stream_interval_ms)) {
+                Proto_Packet stream_pkt;
+                uint8_t stream_body[AUTH_ARG_LEN + 1U + sizeof(g_sensor_data)];
+                uint8_t stream_body_len = Slave_BuildStreamDataBody(stream_body, sizeof(stream_body));
+                if (stream_body_len > 0U) {
+                    stream_pkt.fcf = Proto_FCF_Make(MICS_FCF_TYPE_DATA, false, false);
+                    stream_pkt.seq = g_seq++;
+                    stream_pkt.sess = g_session_id;
+                    stream_pkt.payload_len = Proto_BuildDataPayload(MICS_DTYPE_ECG_DELTA,
+                                                                    g_my_id,
+                                                                    g_authorized_master_id,
+                                                                    stream_body,
+                                                                    stream_body_len,
+                                                                    stream_pkt.payload,
+                                                                    sizeof(stream_pkt.payload));
+                    if (stream_pkt.payload_len > 0U) {
+                        Slave_SendResponse(&stream_pkt, g_active_channel);
+                        g_last_stream_tx_tick = HAL_GetTick();
+                        if (g_stream_remaining_frames > 0U) {
+                            g_stream_remaining_frames--;
+                            if (g_stream_remaining_frames == 0U) {
+                                g_stream_enabled = false;
+                            }
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -601,6 +722,8 @@ static int Slave_HandleMICSSession(void)
     g_active_channel = PROTO_CHANNEL_UNASSIGNED;
     g_last_rx_seq_valid = false;
     memset(g_session_nonce, 0, sizeof(g_session_nonce));
+    g_stream_enabled = false;
+    g_stream_remaining_frames = 0U;
     g_slave_pwr_trace.last_session_end_ms = HAL_GetTick();
     return 0;
 }
