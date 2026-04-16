@@ -30,6 +30,8 @@
 #define AUTH_TAG_LEN   4U
 #define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
 #define STREAM_CFG_SUBCMD 0x01U
+#define STREAM_LOGICAL_DATA_MAX 17U
+#define STREAM_FEC_COPIES 5U
 
 /* ---------- low-power tuning knobs ---------- */
 #define SLAVE_RTC_WAKEUP_INTERVAL_S   300U  /* raise to reduce periodic wakeups */
@@ -118,6 +120,7 @@ static bool Slave_VerifyPollAuth(const Proto_Packet *req);
 static uint8_t Slave_BuildPollDataBody(uint8_t *out, uint8_t out_size);
 static bool Slave_VerifyCmdAuthAndStoreNonce(const Proto_Packet *req);
 static uint8_t Slave_BuildStreamDataBody(uint8_t *out, uint8_t out_size);
+static bool Slave_SendStreamFragments(uint8_t channel);
 
 /* ========================================================================== */
 /* EXTI callback - CC2500 GDO0 wake-up interrupt                              */
@@ -265,6 +268,56 @@ static uint8_t Slave_BuildStreamDataBody(uint8_t *out, uint8_t out_size)
     out[AUTH_ARG_LEN] = g_stream_seq++;
     memcpy(&out[AUTH_ARG_LEN + stream_meta_len], g_sensor_data, body_len);
     return total;
+}
+
+static bool Slave_SendStreamFragments(uint8_t channel)
+{
+    uint8_t logical[STREAM_LOGICAL_DATA_MAX];
+    logical[0] = g_stream_seq++;
+    memcpy(&logical[1], g_sensor_data, sizeof(g_sensor_data));
+
+    uint8_t logical_len = (uint8_t)(1U + sizeof(g_sensor_data));
+    if (logical_len > STREAM_LOGICAL_DATA_MAX) {
+        return false;
+    }
+
+    for (uint8_t copy_idx = 0U; copy_idx < STREAM_FEC_COPIES; copy_idx++) {
+        uint8_t body[AUTH_ARG_LEN + 4U + STREAM_LOGICAL_DATA_MAX];
+        memcpy(body, g_session_nonce, AUTH_NONCE_LEN);
+        uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+        mac_input[0] = g_session_id;
+        memcpy(&mac_input[1], g_my_id, PROTO_DEVICE_ID_LEN);
+        memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_authorized_master_id, PROTO_MASTER_ID_LEN);
+        memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], g_session_nonce, AUTH_NONCE_LEN);
+        uint32_t tag = Slave_Mac32(mac_input, sizeof(mac_input));
+        body[4] = (uint8_t)(tag & 0xFFU);
+        body[5] = (uint8_t)((tag >> 8) & 0xFFU);
+        body[6] = (uint8_t)((tag >> 16) & 0xFFU);
+        body[7] = (uint8_t)((tag >> 24) & 0xFFU);
+        body[AUTH_ARG_LEN] = logical[0]; /* stream_seq */
+        body[AUTH_ARG_LEN + 1U] = copy_idx;
+        body[AUTH_ARG_LEN + 2U] = STREAM_FEC_COPIES;
+        body[AUTH_ARG_LEN + 3U] = logical_len;
+        memcpy(&body[AUTH_ARG_LEN + 4U], logical, logical_len);
+
+        Proto_Packet pkt;
+        pkt.fcf = Proto_FCF_Make(MICS_FCF_TYPE_DATA, false, true);
+        pkt.seq = g_seq++;
+        pkt.sess = g_session_id;
+        pkt.payload_len = Proto_BuildDataPayload(MICS_DTYPE_ECG_DELTA,
+                                                 g_my_id,
+                                                 g_authorized_master_id,
+                                                 body,
+                                                 (uint8_t)(AUTH_ARG_LEN + 4U + logical_len),
+                                                 pkt.payload,
+                                                 sizeof(pkt.payload));
+        if (pkt.payload_len == 0U) {
+            return false;
+        }
+        Slave_SendResponse(&pkt, channel);
+    }
+
+    return true;
 }
 
 /* ========================================================================== */
@@ -631,28 +684,12 @@ static int Slave_HandleMICSSession(void)
         if (st != CC1101_OK) {
             if (g_stream_enabled &&
                 ((HAL_GetTick() - g_last_stream_tx_tick) >= g_stream_interval_ms)) {
-                Proto_Packet stream_pkt;
-                uint8_t stream_body[AUTH_ARG_LEN + 1U + sizeof(g_sensor_data)];
-                uint8_t stream_body_len = Slave_BuildStreamDataBody(stream_body, sizeof(stream_body));
-                if (stream_body_len > 0U) {
-                    stream_pkt.fcf = Proto_FCF_Make(MICS_FCF_TYPE_DATA, false, false);
-                    stream_pkt.seq = g_seq++;
-                    stream_pkt.sess = g_session_id;
-                    stream_pkt.payload_len = Proto_BuildDataPayload(MICS_DTYPE_ECG_DELTA,
-                                                                    g_my_id,
-                                                                    g_authorized_master_id,
-                                                                    stream_body,
-                                                                    stream_body_len,
-                                                                    stream_pkt.payload,
-                                                                    sizeof(stream_pkt.payload));
-                    if (stream_pkt.payload_len > 0U) {
-                        Slave_SendResponse(&stream_pkt, g_active_channel);
-                        g_last_stream_tx_tick = HAL_GetTick();
-                        if (g_stream_remaining_frames > 0U) {
-                            g_stream_remaining_frames--;
-                            if (g_stream_remaining_frames == 0U) {
-                                g_stream_enabled = false;
-                            }
+                if (Slave_SendStreamFragments(g_active_channel)) {
+                    g_last_stream_tx_tick = HAL_GetTick();
+                    if (g_stream_remaining_frames > 0U) {
+                        g_stream_remaining_frames--;
+                        if (g_stream_remaining_frames == 0U) {
+                            g_stream_enabled = false;
                         }
                     }
                 }

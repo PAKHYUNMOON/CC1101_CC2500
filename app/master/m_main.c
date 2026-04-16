@@ -37,6 +37,8 @@
 #define STREAM_CFG_SUBCMD 0x01U
 #define STREAM_USE_OPTIONAL_NACK 0U
 #define STREAM_NACK_MIN_GAP 2U
+#define STREAM_LOGICAL_DATA_MAX 17U
+#define STREAM_FEC_COPIES 5U
 
 /* ---------- hardware handles ---------- */
 static CC1101_HandleTypeDef g_cc1101;
@@ -105,6 +107,20 @@ static uint32_t Master_Mac32(const uint8_t *buf, uint8_t len);
 static void Master_BuildPollAuthArgs(uint8_t sess, uint8_t out[AUTH_ARG_LEN]);
 static bool Master_VerifyPollDataAuth(const Proto_Packet *pkt, uint8_t body_off);
 static bool Master_VerifyStreamDataAuth(const Proto_Packet *pkt, uint8_t body_off);
+typedef struct {
+    bool active;
+    uint8_t stream_seq;
+    uint8_t copy_mask;
+    uint8_t logical_len;
+    uint8_t logical_data[STREAM_LOGICAL_DATA_MAX];
+} Master_StreamReassembly;
+static bool Master_StreamReasmIngest(Master_StreamReassembly *ctx,
+                                     uint8_t stream_seq,
+                                     uint8_t copy_idx,
+                                     uint8_t copy_total,
+                                     const uint8_t *logical_data,
+                                     uint8_t logical_len);
+static bool Master_StreamReasmComplete(const Master_StreamReassembly *ctx);
 
 /* ========================================================================== */
 /* Hardware initialization                                                     */
@@ -234,6 +250,47 @@ static bool Master_VerifyStreamDataAuth(const Proto_Packet *pkt, uint8_t body_of
     return Master_VerifyPollDataAuth(pkt, body_off);
 }
 
+static bool Master_StreamReasmIngest(Master_StreamReassembly *ctx,
+                                     uint8_t stream_seq,
+                                     uint8_t copy_idx,
+                                     uint8_t copy_total,
+                                     const uint8_t *logical_data,
+                                     uint8_t logical_len)
+{
+    if ((ctx == NULL) || (logical_data == NULL) || (logical_len > STREAM_LOGICAL_DATA_MAX)) {
+        return false;
+    }
+    if (copy_total != STREAM_FEC_COPIES) {
+        return false;
+    }
+
+    if ((!ctx->active) || (ctx->stream_seq != stream_seq)) {
+        memset(ctx, 0, sizeof(*ctx));
+        ctx->active = true;
+        ctx->stream_seq = stream_seq;
+        ctx->logical_len = logical_len;
+    }
+
+    if (ctx->logical_len != logical_len) {
+        return false;
+    }
+    if (copy_idx >= STREAM_FEC_COPIES) {
+        return false;
+    }
+
+    memcpy(ctx->logical_data, logical_data, logical_len);
+    ctx->copy_mask |= (uint8_t)(1U << copy_idx);
+    return true;
+}
+
+static bool Master_StreamReasmComplete(const Master_StreamReassembly *ctx)
+{
+    if ((ctx == NULL) || (!ctx->active)) {
+        return false;
+    }
+    return ctx->copy_mask != 0U; /* any one of 5 copies is sufficient */
+}
+
 static int Master_SendStreamNack(uint8_t missing_from_seq)
 {
     uint8_t nack_args[1] = { missing_from_seq };
@@ -337,10 +394,11 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
         return -9;
     }
 
-    /* Receive pushed stream DATA frames */
+    /* Receive pushed stream DATA copies and recover logical frames */
     uint8_t received = 0U;
     bool stream_seq_valid = false;
     uint8_t last_stream_seq = 0U;
+    Master_StreamReassembly reasm = {0};
     while (received < frame_count) {
         if (CC1101_WaitAndReadPacket(&g_cc1101, g_active_channel,
                                      rx_buf, &rx_len, sizeof(rx_buf),
@@ -370,11 +428,24 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
         if (!Master_VerifyStreamDataAuth(&data_pkt, PROTO_DATA_BODY_OFFSET)) {
             continue;
         }
-        /* DATA body: NONCE(4) + TAG(4) + stream_seq(1) + sensor... */
-        if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 1U)) {
+        /* DATA body(copy-FEC mode):
+         * NONCE(4) + TAG(4) + stream_seq(1) + copy_idx(1) + copy_total(1) + logical_len(1) + logical_data */
+        if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 4U)) {
             continue;
         }
         uint8_t stream_seq = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN];
+        uint8_t copy_idx = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 1U];
+        uint8_t copy_total = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 2U];
+        uint8_t logical_len = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 3U];
+        uint8_t logical_data_off = (uint8_t)(PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 4U);
+        if (data_pkt.payload_len < (uint8_t)(logical_data_off + logical_len)) {
+            continue;
+        }
+        if (!Master_StreamReasmIngest(&reasm, stream_seq, copy_idx, copy_total,
+                                      &data_pkt.payload[logical_data_off], logical_len)) {
+            continue;
+        }
+
         if (stream_seq_valid) {
             uint8_t expected = (uint8_t)(last_stream_seq + 1U);
             if (stream_seq != expected) {
@@ -386,9 +457,13 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
 #endif
             }
         }
-        last_stream_seq = stream_seq;
-        stream_seq_valid = true;
-        received++;
+
+        if (Master_StreamReasmComplete(&reasm)) {
+            last_stream_seq = stream_seq;
+            stream_seq_valid = true;
+            received++;
+            memset(&reasm, 0, sizeof(reasm));
+        }
     }
 
     return 0;
