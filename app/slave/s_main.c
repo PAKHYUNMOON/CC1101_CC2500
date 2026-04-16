@@ -274,9 +274,12 @@ static bool Slave_SendStreamFragments(uint8_t channel)
 {
     uint8_t logical[STREAM_LOGICAL_DATA_MAX];
     logical[0] = g_stream_seq++;
-    memcpy(&logical[1], g_sensor_data, sizeof(g_sensor_data));
+    logical[1] = PROTO_APP_TYPE_WAVEFORM;
+    logical[2] = PROTO_WAVEFORM_ECG;
+    logical[3] = (uint8_t)sizeof(g_sensor_data); /* raw sample block length */
+    memcpy(&logical[4], g_sensor_data, sizeof(g_sensor_data));
 
-    uint8_t logical_len = (uint8_t)(1U + sizeof(g_sensor_data));
+    uint8_t logical_len = (uint8_t)(4U + sizeof(g_sensor_data));
     if (logical_len > STREAM_LOGICAL_DATA_MAX) {
         return false;
     }
