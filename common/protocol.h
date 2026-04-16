@@ -90,6 +90,29 @@ extern "C" {
 #define MICS_DTYPE_COMMAND           0xA0U   /* control command           */
 #define MICS_DTYPE_EMERGENCY         0xFFU   /* emergency data (priority) */
 
+/* ---------- Stream logical-data application types ---------- */
+#define PROTO_APP_TYPE_WAVEFORM      0x01U
+#define PROTO_APP_TYPE_MEASUREMENT   0x02U
+#define PROTO_APP_TYPE_EVENT         0x03U
+
+/* ---------- Waveform kinds ---------- */
+#define PROTO_WAVEFORM_ECG           0x01U
+#define PROTO_WAVEFORM_EGM           0x02U
+#define PROTO_WAVEFORM_SENSOR_RAW    0x03U
+
+/* ---------- Measurement bitmap bits ---------- */
+#define PROTO_MEAS_HR_BIT            0x01U
+#define PROTO_MEAS_TEMP_BIT          0x02U
+#define PROTO_MEAS_BATT_BIT          0x04U
+#define PROTO_MEAS_IMPEDANCE_BIT     0x08U
+
+/* ---------- Event codes ---------- */
+#define PROTO_EVENT_STIM             0x01U
+#define PROTO_EVENT_ABNORMAL         0x02U
+#define PROTO_EVENT_WAKEUP           0x03U
+#define PROTO_EVENT_FAULT            0x04U
+#define PROTO_EVENT_LOW_BATTERY      0x05U
+
 /* ==========================================================================
  * Command sub-codes
  *
