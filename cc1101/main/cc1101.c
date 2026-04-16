@@ -364,7 +364,7 @@ CC1101_Status CC1101_InitMICSLike26MHz(CC1101_HandleTypeDef *dev)
         { CC1101_SYNC1,    0xD3 },
         { CC1101_SYNC0,    0x91 },
         { CC1101_PKTLEN,   CC1101_PKT_MAX_LEN },
-        { CC1101_PKTCTRL1, 0x04 }, /* APPEND_STATUS=1 */
+        { CC1101_PKTCTRL1, 0x44 }, /* PQT=2 (8-bit preamble quality threshold, noise filter) + APPEND_STATUS=1 */
         { CC1101_PKTCTRL0, 0x05 }, /* variable length + CRC */
         { CC1101_ADDR,     0x00 },
         { CC1101_CHANNR,   0x00 },
@@ -386,8 +386,14 @@ CC1101_Status CC1101_InitMICSLike26MHz(CC1101_HandleTypeDef *dev)
 
         /* Main radio control */
         { CC1101_MCSM2,    0x07 },
-        { CC1101_MCSM1,    0x00 }, /* RX/TX end -> IDLE */
-        { CC1101_MCSM0,    0x18 }, /* auto-calibrate on IDLE->RX/TX */
+        /* MCSM1: RXOFF=IDLE (00), TXOFF=RX (11)
+         *   After TX response, CC1101 returns to RX automatically —
+         *   saves one IDLE→RX PLL restart per round-trip exchange. */
+        { CC1101_MCSM1,    0x03 },
+        /* MCSM0: FS_AUTOCAL=11 (every 4th IDLE→RX/TX) + PO_TIMEOUT=10
+         *   Reduces PLL calibration overhead from every transition to
+         *   once per 4 cycles (~721 us saved on 3 out of 4 entries). */
+        { CC1101_MCSM0,    0x38 },
 
         /* FS / AGC */
         { CC1101_FOCCFG,   0x16 },

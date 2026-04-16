@@ -1,20 +1,28 @@
 /*
  * Slave (Implant) - Implantable Device Application
  *
- * Ultra-low power operation:
- *   1. MCU in Stop 2 mode (~2 uA)
- *   2. CC2500 in WOR mode (periodic RX sniff at 2.4 GHz)
- *   3. CC2500 GDO0 -> EXTI wakes MCU on beacon detection
- *   4. CC1101 is powered down until communication session
+ * Ultra-low power design — two phases:
  *
- * Communication flow (Slave never initiates):
- *   1. CC2500 WOR detects wake-up beacon -> GDO0 EXTI -> MCU wakes
- *   2. Parse beacon, remember SESS + assigned MICS CHANNEL (chosen by Master
- *      via LBT before the beacon was sent)
- *   3. CC2500 sends wake-up ACK echoing DEVICE_ID+SESS+CHANNEL
- *   4. CC1101 tunes directly to the assigned MICS channel (no scanning)
- *   5. CC1101 responds to Master commands filtered by SESS + DEVICE_ID
- *   6. CC1101 powers down, CC2500 re-enters WOR, MCU -> Stop 2
+ *   ┌─────────────────────────────────────────────────────────────────────┐
+ *   │  IDLE phase (waiting for Master wake-up beacon)                    │
+ *   │  MCU    : Stop 2  ~1.6 uA                                          │
+ *   │  CC2500 : WOR     ~70 uA avg  (500 ms sniff @ 2.4 GHz OOK)        │
+ *   │  CC1101 : SLEEP   ~200 nA     (SPWD strobe)                        │
+ *   │  Wake   : CC2500 GDO0 EXTI (CRC OK on beacon)                      │
+ *   │           RTC 60 s timer    (periodic self-check)                   │
+ *   │  Total  : ~72 uA  — dominated by CC2500 WOR sniff                  │
+ *   ├─────────────────────────────────────────────────────────────────────┤
+ *   │  SESSION phase (MICS 400 MHz data exchange, typically < 5 s)       │
+ *   │  MCU    : Stop 2 between frames  ~1.6 uA                           │
+ *   │  CC1101 : RX      ~15 mA  — dominant, minimised by short dwell    │
+ *   │           IDLE between frames when MCU is in Stop 2                │
+ *   │  CC2500 : IDLE                                                      │
+ *   │  Wake   : CC1101 GDO0 EXTI (CRC OK on command frame)               │
+ *   │           RTC SESSION_TIMEOUT_S timer (session watchdog)           │
+ *   └─────────────────────────────────────────────────────────────────────┘
+ *
+ * HAL_GetTick() stops advancing while MCU is in Stop 2 so session timeout
+ * is implemented via the RTC wake-up timer, not HAL_GetTick().
  *
  * MCU: STM32U575 Q-series
  * Radios: CC2500 (2.4 GHz WOR wake-up), CC1101 (400 MHz MICS data)
@@ -54,10 +62,11 @@ static const uint8_t g_authorized_master_id[PROTO_MASTER_ID_LEN] =
     {0xAA, 0xBB, 0xCC, 0xDD};
 
 /* ---------- session state ---------- */
-static volatile bool g_wakeup_flag = false;
+static volatile bool g_wakeup_flag     = false;   /* CC2500 GDO0 EXTI flag */
+static volatile bool g_cc1101_pkt_flag = false;   /* CC1101 GDO0 EXTI flag */
 static uint8_t g_seq = 0U;
-static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED; /* assigned by Master wake-up */
-static uint8_t g_active_channel = PROTO_CHANNEL_UNASSIGNED; /* MICS channel carried in beacon */
+static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED;
+static uint8_t g_active_channel = PROTO_CHANNEL_UNASSIGNED;
 
 /* ---------- simulated sensor data ---------- */
 static uint8_t g_sensor_data[16] = {
@@ -66,6 +75,9 @@ static uint8_t g_sensor_data[16] = {
     0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00
 };
+
+/* Session timeout in seconds (derived from ms constant, rounded up) */
+#define SESSION_TIMEOUT_S   ((PROTO_SESSION_TIMEOUT_MS + 999U) / 1000U)
 
 /* ---------- forward declarations ---------- */
 static void Slave_InitHardware(void);
@@ -76,13 +88,17 @@ static int  Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp);
 static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel);
 
 /* ========================================================================== */
-/* EXTI callback - CC2500 GDO0 wake-up interrupt                              */
+/* EXTI callbacks                                                              */
 /* ========================================================================== */
 
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
     if (GPIO_Pin == g_cc2500.gdo0_pin) {
+        /* CC2500 GDO0: WOR beacon received (CRC OK) */
         g_wakeup_flag = true;
+    } else if (GPIO_Pin == g_cc1101.gdo0_pin) {
+        /* CC1101 GDO0: MICS command frame received (CRC OK) */
+        g_cc1101_pkt_flag = true;
     }
 }
 
@@ -94,73 +110,75 @@ static void Slave_InitHardware(void)
 {
     CC1101_DWT_DelayInit();
 
-    /* CC1101 handle (400 MHz MICS) - initially not used */
+    /* CC1101 handle (400 MHz MICS) */
     g_cc1101.hspi      = &hspi1;
     g_cc1101.cs_port   = GPIOA;
     g_cc1101.cs_pin    = GPIO_PIN_4;
     g_cc1101.miso_port = GPIOA;
     g_cc1101.miso_pin  = GPIO_PIN_6;
     g_cc1101.gdo0_port = GPIOB;
-    g_cc1101.gdo0_pin  = GPIO_PIN_0;
+    g_cc1101.gdo0_pin  = GPIO_PIN_0;  /* PB0 = EXTI0 */
 
-    /* CC2500 handle (2.4 GHz wake-up) */
+    /* CC2500 handle (2.4 GHz WOR wake-up) */
     g_cc2500.hspi      = &hspi2;
     g_cc2500.cs_port   = GPIOB;
     g_cc2500.cs_pin    = GPIO_PIN_12;
     g_cc2500.miso_port = GPIOB;
     g_cc2500.miso_pin  = GPIO_PIN_14;
     g_cc2500.gdo0_port = GPIOB;
-    g_cc2500.gdo0_pin  = GPIO_PIN_1;
+    g_cc2500.gdo0_pin  = GPIO_PIN_1;  /* PB1 = EXTI1 */
 
-    /* Low-power handle */
-    g_lp.hspi_cc1101 = &hspi1;
-    g_lp.hspi_cc2500 = &hspi2;
-    g_lp.gdo0_port   = g_cc2500.gdo0_port;
-    g_lp.gdo0_pin    = g_cc2500.gdo0_pin;
-    g_lp.gdo0_irqn   = EXTI1_IRQn;
-    g_lp.hrtc         = &hrtc;
+    /* Low-power handle:
+     *   CC2500 GDO0 on EXTI1 (WOR beacon → IDLE phase wake)
+     *   CC1101 GDO0 on EXTI0 (MICS frame → SESSION phase wake)
+     *   RTC: 60 s self-check in IDLE; SESSION_TIMEOUT_S watchdog in SESSION */
+    g_lp.hspi_cc1101        = &hspi1;
+    g_lp.hspi_cc2500        = &hspi2;
+    g_lp.gdo0_port          = g_cc2500.gdo0_port;
+    g_lp.gdo0_pin           = g_cc2500.gdo0_pin;
+    g_lp.gdo0_irqn          = EXTI1_IRQn;
+    g_lp.cc1101_gdo0_port   = g_cc1101.gdo0_port;
+    g_lp.cc1101_gdo0_pin    = g_cc1101.gdo0_pin;
+    g_lp.cc1101_gdo0_irqn   = EXTI0_IRQn;
+    g_lp.hrtc               = &hrtc;
 
     LP_Init(&g_lp);
 
-    /* Use lowest voltage scaling for minimum power */
+    /* VOS4: lowest core voltage (max 24 MHz) — minimum active current */
     LP_SetVoltageScaling_LowPower();
 
-    /* Initialize CC2500 for WOR wake-up mode */
+    /* Configure CC2500 for WOR beacon reception */
     CC2500_InitWakeUp26MHz(&g_cc2500);
 }
 
 /* ========================================================================== */
-/* Deep sleep entry (main idle state)                                          */
+/* IDLE phase deep sleep                                                       */
 /* ========================================================================== */
 
 static void Slave_EnterDeepSleep(void)
 {
-    /* Ensure CC1101 is in sleep mode */
+    /* CC1101 in SLEEP (SPWD, ~200 nA) */
     CC1101_EnterSleep(&g_cc1101);
 
-    /* Put CC2500 into WOR mode for wake-up monitoring */
+    /* CC2500 in WOR (~70 uA avg at 500 ms sniff interval) */
     CC2500_EnterWOR(&g_cc2500);
 
-    /* Configure RTC for periodic self-check (e.g., every 60 seconds) */
+    /* RTC 60 s periodic self-check */
     LP_ConfigureRTCWakeUp(&g_lp, 60U);
 
-    /* Enter Stop 2 - MCU draws ~2 uA
-     * Wake-up sources:
-     *   - CC2500 GDO0 EXTI (beacon received)
-     *   - RTC wake-up timer (periodic self-check)
-     */
+    /* MCU in Stop 2 (~1.6 uA)
+     * Wake: CC2500 GDO0 EXTI  or  RTC 60 s */
     LP_WakeupSource src = LP_EnterStop2(&g_lp);
-
-    /* --- MCU wakes up here --- */
 
     if (src & LP_WAKEUP_EXTI_GDO0) {
         g_wakeup_flag = true;
     }
 
     if (src & LP_WAKEUP_RTC_ALARM) {
-        /* Periodic self-check: battery level, sensor status, etc.
-         * If nothing to do, go back to sleep immediately */
-        g_sensor_data[8] = (uint8_t)(HAL_GetTick() & 0xFFU);  /* timestamp */
+        /* Periodic self-check: update timestamp; add battery / sensor checks
+         * as needed.  If nothing needs processing, the loop returns here
+         * and re-enters Stop 2 on the next iteration. */
+        g_sensor_data[8] = (uint8_t)(g_seq & 0xFFU);  /* lightweight activity */
     }
 }
 
@@ -173,7 +191,7 @@ static int Slave_HandleWakeUp(void)
     uint8_t rx_buf[CC2500_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
 
-    /* 1) Read the received beacon packet from CC2500 */
+    /* 1) Read beacon from CC2500 RX FIFO */
     CC2500_Status st = CC2500_ReadPacket(&g_cc2500, rx_buf, &rx_len, sizeof(rx_buf));
     if (st != CC2500_OK) {
         return -1;
@@ -185,7 +203,7 @@ static int Slave_HandleWakeUp(void)
         return -2;
     }
 
-    /* 3) Validate FCF: must be COMMAND type, ACK_REQ set */
+    /* 3) Validate FCF: must be COMMAND type */
     if (Proto_FCF_Type(beacon.fcf) != MICS_FCF_TYPE_COMMAND) {
         return -3;
     }
@@ -205,45 +223,41 @@ static int Slave_HandleWakeUp(void)
         return -6;
     }
 
-    /* 5) Verify this beacon is addressed to us (or broadcast) */
+    /* 5) Verify DEVICE_ID (us or broadcast) */
     const uint8_t *target_id = &beacon.payload[PROTO_BEACON_DEVID_OFFSET];
     if (!Proto_MatchDeviceID(target_id, g_my_id)) {
         return -7;
     }
 
-    /* 6) Verify MASTER_ID - reject beacons from unauthorised Masters.
-     *    Without this check, anyone learning the Slave's DEVICE_ID could
-     *    wake the implant and hold a session. */
+    /* 6) Verify MASTER_ID — silent drop if not our paired Master */
     if (!Proto_VerifyPayloadMasterID(&beacon,
                                      PROTO_BEACON_MASTERID_OFFSET,
                                      g_authorized_master_id)) {
-        return -8;  /* silent drop - unknown Master */
+        return -8;
     }
 
-    /* 7) Remember the SESS assigned by Master */
+    /* 7) Validate assigned SESS */
     uint8_t assigned_sess = beacon.payload[PROTO_BEACON_SESS_OFFSET];
     if ((assigned_sess == PROTO_SESS_UNASSIGNED) ||
         (assigned_sess == PROTO_SESS_BROADCAST)) {
-        return -9; /* invalid SESS allocation */
+        return -9;
     }
 
-    /* 8) Remember the MICS channel the Master pre-selected via LBT.
-     *    This removes the need for the Slave to scan channels 0..9 on 400 MHz,
-     *    which saves significant battery on the implant. */
+    /* 8) Accept the pre-selected MICS channel (no scanning needed) */
     uint8_t assigned_channel = beacon.payload[PROTO_BEACON_CHANNEL_OFFSET];
     if (assigned_channel >= CC1101_MICS_NUM_CHANNELS) {
-        return -10; /* Master must pre-select a valid MICS channel */
+        return -10;
     }
 
     g_session_id     = assigned_sess;
     g_active_channel = assigned_channel;
 
-    /* 9) Build and send wake-up ACK: echo DEVICE_ID + MASTER_ID +
+    /* 9) Build and send wake-up ACK echoing DEVICE_ID + MASTER_ID +
      *    SESS + CHANNEL so Master can verify bilateral binding. */
     Proto_Packet ack;
     ack.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
     ack.seq  = g_seq++;
-    ack.sess = PROTO_SESS_BROADCAST;  /* session not yet bilaterally confirmed */
+    ack.sess = PROTO_SESS_BROADCAST;
     ack.payload_len = Proto_BuildBeaconPayload(CMD_WAKEUP_ACK,
                                                g_my_id,
                                                g_authorized_master_id,
@@ -272,11 +286,9 @@ static int Slave_HandleWakeUp(void)
 }
 
 /* ========================================================================== */
-/* Phase 2: MICS data session                                                  */
+/* Phase 2: MICS data session (low-power RX loop)                              */
 /* ========================================================================== */
 
-/* Build a COMMAND-frame response carrying
- *   [DTYPE, sub_cmd, g_my_id, g_authorized_master_id, args...] */
 static void slave_build_cmd_response(Proto_Packet *resp,
                                      uint8_t sub_cmd,
                                      const uint8_t *args, uint8_t args_len)
@@ -291,11 +303,9 @@ static void slave_build_cmd_response(Proto_Packet *resp,
 
 static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
 {
-    /* Session is already validated by caller; just echo SESS */
     resp->seq  = req->seq;
     resp->sess = g_session_id;
 
-    /* All inbound COMMAND packets: payload = [DTYPE, SUBCMD, DEVID[4], args] */
     if (req->payload_len < PROTO_CMD_HEADER_LEN) {
         uint8_t st = PROTO_STATUS_ERR_UNKNOWN_CMD;
         slave_build_cmd_response(resp, CMD_DATA_ACK, &st, 1U);
@@ -306,11 +316,6 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
 
     switch (sub_cmd) {
     case CMD_POLL_REQ:
-    {
-        /* Respond with DATA-type frame:
-         *   [DTYPE_ECG_DELTA, g_my_id, g_authorized_master_id, sensor...]
-         * DEVICE_ID proves "I am the implant you woke up";
-         * MASTER_ID echo proves "I am still bound to this authorised Master". */
         resp->fcf = Proto_FCF_Make(MICS_FCF_TYPE_DATA, false, false);
         resp->payload_len = Proto_BuildDataPayload(MICS_DTYPE_ECG_DELTA,
                                                    g_my_id,
@@ -320,11 +325,9 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
                                                    resp->payload,
                                                    sizeof(resp->payload));
         break;
-    }
 
     case CMD_DATA_WRITE:
     {
-        /* Write args start at payload[PROTO_CMD_ARGS_OFFSET] */
         uint8_t status = (req->payload_len > PROTO_CMD_ARGS_OFFSET)
                          ? PROTO_STATUS_OK
                          : PROTO_STATUS_ERR_UNKNOWN_CMD;
@@ -359,12 +362,15 @@ static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel)
         return;
     }
 
-    /* Slave responds on the channel Master selected (Master already cleared
-     * it via LBT). Use SendPacketLBT with threshold=-120 dBm so the CCA
-     * always passes (effectively direct send). */
+    /* Slave responds on the channel Master pre-selected via LBT.
+     * Use CCA threshold = -120 dBm (effectively bypassed) because
+     * the Master already cleared the channel; a false CCA block here
+     * would only cause unnecessary retries. */
     (void)CC1101_SendPacketLBT(&g_cc1101, channel,
                                tx_buf, tx_len,
                                -120, 1U, 200U);
+    /* After TX, MCSM1.TXOFF_MODE=RX (0x03) returns CC1101 to RX
+     * automatically, ready for the next incoming command. */
 }
 
 static int Slave_HandleMICSSession(void)
@@ -373,80 +379,97 @@ static int Slave_HandleMICSSession(void)
     uint8_t rx_len = 0U;
     Proto_Packet req_pkt, resp_pkt;
     bool session_active = true;
-    uint32_t session_start = HAL_GetTick();
 
-    /* Guard: a valid channel must have been assigned in the wake-up beacon */
     if (g_active_channel >= CC1101_MICS_NUM_CHANNELS) {
         return -1;
     }
 
-    /* Initialize CC1101 for MICS communication */
+    /* Bring CC1101 up and configure for MICS session */
     CC1101_WakeFromSleep(&g_cc1101);
     CC1101_InitMICSLike26MHz(&g_cc1101);
 
+    /* Enter RX on the channel the Master pre-selected via LBT.
+     * CC1101 stays in RX; MCU enters Stop 2 between frames. */
+    CC1101_EnterRx(&g_cc1101, g_active_channel);
+
+    /* Session watchdog: RTC fires after SESSION_TIMEOUT_S.
+     * Because HAL_GetTick() stops during Stop 2, we rely on the RTC
+     * timer rather than HAL_GetTick()-based elapsed-time tracking. */
+    LP_ConfigureRTCWakeUp(&g_lp, SESSION_TIMEOUT_S);
+
     while (session_active) {
-        /* Check session timeout */
-        if ((HAL_GetTick() - session_start) > PROTO_SESSION_TIMEOUT_MS) {
+        /* --- MCU enters Stop 2 (~1.6 uA) ---
+         * Wake sources:
+         *   LP_WAKEUP_EXTI_CC1101_GDO0 : CC1101 GDO0 asserted (CRC OK packet)
+         *   LP_WAKEUP_RTC_ALARM        : session timeout
+         * CC1101 remains in RX during Stop 2; its current (~15 mA) dominates
+         * in the session phase, but the MCU's contribution drops from
+         * ~1 mA (busy-poll at 4 MHz) to ~1.6 uA. */
+        g_cc1101_pkt_flag = false;
+        LP_WakeupSource src = LP_EnterStop2(&g_lp);
+
+        if (src & LP_WAKEUP_RTC_ALARM) {
+            /* Session timed out — return to IDLE phase */
             break;
         }
 
-        /* Tune to the channel the Master pre-selected via LBT - no scanning */
-        CC1101_Status st = CC1101_WaitAndReadPacket(&g_cc1101,
-                                                    g_active_channel,
-                                                    rx_buf, &rx_len,
-                                                    sizeof(rx_buf),
-                                                    100U); /* 100 ms window */
-        if (st != CC1101_OK) {
+        if (!(src & LP_WAKEUP_EXTI_CC1101_GDO0)) {
+            /* Spurious wake (e.g. CC2500 GDO0) — re-enter Stop 2 */
+            continue;
+        }
+
+        /* --- CC1101 packet ready in FIFO --- */
+        if (CC1101_ReadPacket(&g_cc1101, rx_buf, &rx_len, sizeof(rx_buf)) != CC1101_OK) {
+            /* FIFO error; re-enter RX and try again */
+            CC1101_EnterRx(&g_cc1101, g_active_channel);
             continue;
         }
 
         if (Proto_ParsePacket(rx_buf, rx_len, &req_pkt) < 0) {
+            CC1101_EnterRx(&g_cc1101, g_active_channel);
             continue;
         }
 
-        /* Filter by session ID (1B fast check) */
+        /* Filter by session ID */
         if (!Proto_MatchSession(req_pkt.sess, g_session_id)) {
+            CC1101_EnterRx(&g_cc1101, g_active_channel);
             continue;
         }
 
-        /* Only COMMAND frames are accepted from Master on 400 MHz */
+        /* Only COMMAND frames from Master on 400 MHz */
         if (Proto_FCF_Type(req_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
+            CC1101_EnterRx(&g_cc1101, g_active_channel);
             continue;
         }
 
-        /* Triple-verify the handoff from 2.4 GHz wake-up:
-         *   - SESS (already matched above)
-         *   - DEVICE_ID in payload offset 2..5
-         *   - MASTER_ID in payload offset 6..9
-         * DEVICE_ID proves the Master still knows whom it woke up.
-         * MASTER_ID proves this is the same authorised Master that
-         * initiated the wake-up (and not a concurrent Master guessing
-         * the SESS). Silently drop unauthenticated COMMAND frames so
-         * the attacker gains no side-channel signal. */
+        /* Triple verify: SESS (above) + DEVICE_ID + MASTER_ID */
         if (!Proto_VerifyPayloadDeviceID(&req_pkt,
                                          PROTO_CMD_DEVID_OFFSET,
                                          g_my_id)) {
+            CC1101_EnterRx(&g_cc1101, g_active_channel);
             continue;
         }
         if (!Proto_VerifyPayloadMasterID(&req_pkt,
                                          PROTO_CMD_MASTERID_OFFSET,
                                          g_authorized_master_id)) {
+            CC1101_EnterRx(&g_cc1101, g_active_channel);
             continue;
         }
 
-        /* Process command and send response on the same channel */
+        /* Process command and send response */
         Slave_ProcessCommand(&req_pkt, &resp_pkt);
         Slave_SendResponse(&resp_pkt, g_active_channel);
+        /* MCSM1.TXOFF=RX: CC1101 auto-returns to RX after TX —
+         * no explicit re-entry needed for the next round. */
 
-        /* Check if session should end (SLEEP command) */
+        /* End session on SLEEP command */
         if ((req_pkt.payload_len >= PROTO_CMD_HEADER_LEN) &&
             (req_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] == CMD_SLEEP_CMD)) {
             session_active = false;
         }
-
-        /* Reset session timer on valid packet */
-        session_start = HAL_GetTick();
     }
+
+    LP_DisableRTCWakeUp(&g_lp);
 
     /* Invalidate session */
     g_session_id     = PROTO_SESS_UNASSIGNED;
@@ -466,33 +489,33 @@ void Slave_AppMain(void)
 
     Slave_InitHardware();
 
-    /* Put CC1101 to sleep at startup (not needed until communication) */
+    /* CC1101 starts in SLEEP — not needed until a session is established */
     CC1101_EnterSleep(&g_cc1101);
 
     while (1) {
-        /* Enter deep sleep - this is the primary state
-         * MCU + CC1101 in deep sleep
-         * CC2500 in WOR mode, sniffing for wake-up beacons
+        /* Primary state: IDLE deep sleep
+         *   MCU     : Stop 2 (~1.6 uA)
+         *   CC2500  : WOR    (~70 uA avg)
+         *   CC1101  : SLEEP  (~200 nA)
+         *   Total   : ~72 uA
          */
         Slave_EnterDeepSleep();
 
-        /* Check if woken by CC2500 beacon */
         if (g_wakeup_flag) {
             g_wakeup_flag = false;
 
-            /* Handle the wake-up beacon - parses and stores SESS */
+            /* Parse beacon → store SESS + CHANNEL → send Wake-up ACK */
             int rc = Slave_HandleWakeUp();
-
             if (rc == 0) {
-                /* Wake-up successful - enter MICS data session */
+                /* SESSION phase: MCU Stop 2 + CC1101 RX + RTC watchdog */
                 Slave_HandleMICSSession();
             }
 
-            /* Session done or wake-up failed - return to deep sleep */
+            /* Session done or beacon invalid — back to IDLE */
             CC1101_EnterSleep(&g_cc1101);
         }
 
-        /* If woken by RTC, the self-check was done in Slave_EnterDeepSleep.
-         * Loop back to sleep. */
+        /* If woken by RTC self-check: housekeeping was done in
+         * Slave_EnterDeepSleep(); loop back to Stop 2. */
     }
 }
