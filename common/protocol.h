@@ -343,6 +343,18 @@ static inline bool Proto_MatchDeviceID(const uint8_t *id_a, const uint8_t *id_b)
     return true;
 }
 
+/* Strict comparison for authenticated paths (no broadcast wildcard). */
+static inline bool Proto_MatchDeviceID_Strict(const uint8_t *id_a, const uint8_t *id_b)
+{
+    if ((id_a == NULL) || (id_b == NULL)) {
+        return false;
+    }
+    for (uint8_t i = 0U; i < PROTO_DEVICE_ID_LEN; i++) {
+        if (id_a[i] != id_b[i]) { return false; }
+    }
+    return true;
+}
+
 /* ==========================================================================
  * Master ID helpers (included in every wake-up / COMMAND / DATA frame)
  * ========================================================================== */
@@ -356,6 +368,18 @@ static inline bool Proto_MatchMasterID(const uint8_t *id_a, const uint8_t *id_b)
     }
     if (is_broadcast) { return true; }
 
+    for (uint8_t i = 0U; i < PROTO_MASTER_ID_LEN; i++) {
+        if (id_a[i] != id_b[i]) { return false; }
+    }
+    return true;
+}
+
+/* Strict comparison for authenticated paths (no broadcast wildcard). */
+static inline bool Proto_MatchMasterID_Strict(const uint8_t *id_a, const uint8_t *id_b)
+{
+    if ((id_a == NULL) || (id_b == NULL)) {
+        return false;
+    }
     for (uint8_t i = 0U; i < PROTO_MASTER_ID_LEN; i++) {
         if (id_a[i] != id_b[i]) { return false; }
     }
@@ -478,7 +502,7 @@ static inline bool Proto_VerifyPayloadDeviceID(const Proto_Packet *pkt,
     if (pkt->payload_len < (devid_offset + PROTO_DEVICE_ID_LEN)) {
         return false;
     }
-    return Proto_MatchDeviceID(&pkt->payload[devid_offset], expected_id);
+    return Proto_MatchDeviceID_Strict(&pkt->payload[devid_offset], expected_id);
 }
 
 /* ==========================================================================
@@ -495,7 +519,18 @@ static inline bool Proto_VerifyPayloadMasterID(const Proto_Packet *pkt,
     if (pkt->payload_len < (masterid_offset + PROTO_MASTER_ID_LEN)) {
         return false;
     }
-    return Proto_MatchMasterID(&pkt->payload[masterid_offset], expected_id);
+    return Proto_MatchMasterID_Strict(&pkt->payload[masterid_offset], expected_id);
+}
+
+/* ==========================================================================
+ * Sequence anti-replay helpers (modulo-256 monotonic window)
+ * - true  : incoming_seq is newer than last_seq
+ * - false : duplicate or old/replayed frame
+ * ========================================================================== */
+static inline bool Proto_IsSeqNewer(uint8_t incoming_seq, uint8_t last_seq)
+{
+    uint8_t delta = (uint8_t)(incoming_seq - last_seq);
+    return (delta != 0U) && (delta <= 127U);
 }
 
 #ifdef __cplusplus
