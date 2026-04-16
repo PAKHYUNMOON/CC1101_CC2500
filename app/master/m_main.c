@@ -1,5 +1,10 @@
 /*
  * Master (Programmer) - External Device Application
+ * Ultra-low power operation: kimagu 2023.10.13
+ *   1. MCU in Stop 2 mode (~2 uA)
+ *   2. CC2500 in WOR mode (periodic RX sniff at 2.4 GHz)
+ *   3. CC2500 GDO0 -> EXTI wakes MCU on beacon detection
+ *   4. CC1101 is powered down until communication session
  *
  * Communication flow (LBT-first, same-channel retry):
  *   0. (internal) CC1101 runs LBT over MICS ch 0..9, picks a free channel N
@@ -25,6 +30,10 @@
 #include "protocol.h"
 #include "stm32u575_lowpower.h"
 #include <string.h>
+
+#define AUTH_NONCE_LEN 4U
+#define AUTH_TAG_LEN   4U
+#define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
 
 /* ---------- hardware handles ---------- */
 static CC1101_HandleTypeDef g_cc1101;
@@ -53,6 +62,14 @@ static uint8_t g_seq = 0U;
 static uint8_t g_active_channel = 0U;
 static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED;
 static uint8_t g_next_sess      = 1U;   /* rolling session ID generator */
+static uint8_t g_last_rx_seq = 0U;
+static bool    g_last_rx_seq_valid = false;
+static uint8_t g_poll_nonce[AUTH_NONCE_LEN] = {0};
+
+static const uint8_t g_auth_key[16] = {
+    0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
+    0x91, 0x2B, 0xC4, 0x6E, 0x58, 0xFD, 0x03, 0xAB
+};
 
 /* ---------- LBT retry policy (Patch B) ----------
  * Once Master has pre-selected a channel via LBT and advertised it in the
@@ -76,6 +93,9 @@ static int  Master_SendSleepCommand(void);
 static int  Master_CommunicationSession(void);
 static CC1101_Status Master_TxLBT_SameChannel(const uint8_t *tx_buf,
                                               uint8_t tx_len);
+static uint32_t Master_Mac32(const uint8_t *buf, uint8_t len);
+static void Master_BuildPollAuthArgs(uint8_t sess, uint8_t out[AUTH_ARG_LEN]);
+static bool Master_VerifyPollDataAuth(const Proto_Packet *pkt, uint8_t body_off);
 
 /* ========================================================================== */
 /* Hardware initialization                                                     */
@@ -134,6 +154,70 @@ static uint8_t Master_AllocateSession(void)
         s = 1U;
     }
     return s;
+}
+
+static uint32_t Master_Mac32(const uint8_t *buf, uint8_t len)
+{
+    uint32_t h = 2166136261UL;
+    for (uint8_t i = 0U; i < sizeof(g_auth_key); i++) {
+        h ^= g_auth_key[i];
+        h *= 16777619UL;
+    }
+    for (uint8_t i = 0U; i < len; i++) {
+        h ^= buf[i];
+        h *= 16777619UL;
+    }
+    return h;
+}
+
+static void Master_BuildPollAuthArgs(uint8_t sess, uint8_t out[AUTH_ARG_LEN])
+{
+    uint32_t t = HAL_GetTick() ^ (((uint32_t)g_seq) << 24) ^ ((uint32_t)sess << 16);
+    g_poll_nonce[0] = (uint8_t)(t & 0xFFU);
+    g_poll_nonce[1] = (uint8_t)((t >> 8) & 0xFFU);
+    g_poll_nonce[2] = (uint8_t)((t >> 16) & 0xFFU);
+    g_poll_nonce[3] = (uint8_t)((t >> 24) & 0xFFU);
+
+    memcpy(out, g_poll_nonce, AUTH_NONCE_LEN);
+
+    uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+    mac_input[0] = sess;
+    memcpy(&mac_input[1], g_target_id, PROTO_DEVICE_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_master_id, PROTO_MASTER_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], g_poll_nonce, AUTH_NONCE_LEN);
+
+    uint32_t tag = Master_Mac32(mac_input, sizeof(mac_input));
+    out[4] = (uint8_t)(tag & 0xFFU);
+    out[5] = (uint8_t)((tag >> 8) & 0xFFU);
+    out[6] = (uint8_t)((tag >> 16) & 0xFFU);
+    out[7] = (uint8_t)((tag >> 24) & 0xFFU);
+}
+
+static bool Master_VerifyPollDataAuth(const Proto_Packet *pkt, uint8_t body_off)
+{
+    if (pkt->payload_len < (uint8_t)(body_off + AUTH_ARG_LEN)) {
+        return false;
+    }
+
+    const uint8_t *nonce = &pkt->payload[body_off];
+    const uint8_t *tag_b = &pkt->payload[body_off + AUTH_NONCE_LEN];
+
+    if (memcmp(nonce, g_poll_nonce, AUTH_NONCE_LEN) != 0) {
+        return false;
+    }
+
+    uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+    mac_input[0] = g_session_id;
+    memcpy(&mac_input[1], g_target_id, PROTO_DEVICE_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_master_id, PROTO_MASTER_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], nonce, AUTH_NONCE_LEN);
+
+    uint32_t expect = Master_Mac32(mac_input, sizeof(mac_input));
+    uint32_t got = ((uint32_t)tag_b[0]) |
+                   ((uint32_t)tag_b[1] << 8) |
+                   ((uint32_t)tag_b[2] << 16) |
+                   ((uint32_t)tag_b[3] << 24);
+    return expect == got;
 }
 
 /* ========================================================================== */
@@ -267,8 +351,8 @@ static int Master_WakeUpImplant(void)
     if (ack_pkt.payload[PROTO_BEACON_CMD_OFFSET] != CMD_WAKEUP_ACK) {
         return -8;
     }
-    if (!Proto_MatchDeviceID(&ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET],
-                             g_target_id)) {
+    if (!Proto_MatchDeviceID_Strict(&ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET],
+                                    g_target_id)) {
         return -9;
     }
     /* MASTER_ID echo proves the Slave really received OUR wake-up beacon
@@ -287,6 +371,7 @@ static int Master_WakeUpImplant(void)
 
     /* 7) Session established */
     g_session_id = proposed_sess;
+    g_last_rx_seq_valid = false;
     return 0;
 }
 
@@ -312,10 +397,12 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     poll_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, true, false);
     poll_pkt.seq  = g_seq++;
     poll_pkt.sess = g_session_id;
+    uint8_t auth_args[AUTH_ARG_LEN];
+    Master_BuildPollAuthArgs(g_session_id, auth_args);
     poll_pkt.payload_len = Proto_BuildCommandPayload(CMD_POLL_REQ,
                                                      g_target_id,
                                                      g_master_id,
-                                                     NULL, 0U,
+                                                     auth_args, AUTH_ARG_LEN,
                                                      poll_pkt.payload,
                                                      sizeof(poll_pkt.payload));
     if (poll_pkt.payload_len == 0U) {
@@ -352,6 +439,11 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
     if (!Proto_MatchSession(resp_pkt.sess, g_session_id)) {
         return -5;
     }
+    if (g_last_rx_seq_valid && !Proto_IsSeqNewer(resp_pkt.seq, g_last_rx_seq)) {
+        return -6; /* replay/duplicate/out-of-order */
+    }
+    g_last_rx_seq = resp_pkt.seq;
+    g_last_rx_seq_valid = true;
 
     /* Verify DEVICE_ID + MASTER_ID in payload.
      * Triple-check (SESS + DEVICE_ID + MASTER_ID) confirms the response
@@ -368,23 +460,30 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
         masterid_off = PROTO_CMD_MASTERID_OFFSET;
         body_off     = PROTO_CMD_ARGS_OFFSET;
     } else {
-        return -6;
+        return -7;
     }
 
     if (!Proto_VerifyPayloadDeviceID(&resp_pkt, devid_off, g_target_id)) {
-        return -7;  /* Device ID mismatch - possible spoofer or wrong Slave */
+        return -8;  /* Device ID mismatch - possible spoofer or wrong Slave */
     }
     if (!Proto_VerifyPayloadMasterID(&resp_pkt, masterid_off, g_master_id)) {
-        return -8;  /* Slave is echoing a different Master's ID - reject */
+        return -9;  /* Slave is echoing a different Master's ID - reject */
     }
 
     /* Copy application body to caller */
     if (resp_pkt.payload_len < body_off) {
-        return -9;
+        return -10;
+    }
+    if (ftype == MICS_FCF_TYPE_DATA && !Master_VerifyPollDataAuth(&resp_pkt, body_off)) {
+        return -11;
     }
     if ((resp_buf != NULL) && (resp_len != NULL)) {
-        uint8_t n = (uint8_t)(resp_pkt.payload_len - body_off);
-        memcpy(resp_buf, &resp_pkt.payload[body_off], n);
+        uint8_t data_off = body_off;
+        if (ftype == MICS_FCF_TYPE_DATA) {
+            data_off = (uint8_t)(data_off + AUTH_ARG_LEN);
+        }
+        uint8_t n = (uint8_t)(resp_pkt.payload_len - data_off);
+        memcpy(resp_buf, &resp_pkt.payload[data_off], n);
         *resp_len = n;
     }
 
@@ -446,8 +545,13 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
     if (!Proto_MatchSession(ack_pkt.sess, g_session_id)) {
         return -6;
     }
-    if (Proto_FCF_Type(ack_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
+    if (g_last_rx_seq_valid && !Proto_IsSeqNewer(ack_pkt.seq, g_last_rx_seq)) {
         return -7;
+    }
+    g_last_rx_seq = ack_pkt.seq;
+    g_last_rx_seq_valid = true;
+    if (Proto_FCF_Type(ack_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
+        return -8;
     }
     /* Verify DEVICE_ID + MASTER_ID handoff in ACK */
     if (!Proto_VerifyPayloadDeviceID(&ack_pkt, PROTO_CMD_DEVID_OFFSET,
@@ -517,6 +621,7 @@ static int Master_SendSleepCommand(void)
 
     /* Invalidate session */
     g_session_id = PROTO_SESS_UNASSIGNED;
+    g_last_rx_seq_valid = false;
 
     return 0;
 }
