@@ -777,6 +777,10 @@ CC1101_Status CC1101_WaitAndReadPacket(CC1101_HandleTypeDef *dev,
                 return CC1101_ReadPacket(dev, buf, len, max_len);
             }
         }
+
+        /* Yield CPU between polls to avoid busy-spin current burn.
+         * 1 ms keeps latency low while reducing MCU active duty. */
+        HAL_Delay(1U);
     }
 
     (void)CC1101_Idle(dev);
