@@ -73,6 +73,20 @@ static uint8_t g_poll_nonce[AUTH_NONCE_LEN] = {0};
 static uint8_t g_stream_interval_ms = 20U;
 static uint8_t g_stream_frame_count = 4U;
 
+typedef struct {
+    uint8_t last_stream_seq;
+    uint8_t last_waveform_kind;
+    uint8_t last_waveform_len;
+    uint8_t last_waveform_payload[16];
+    uint8_t last_meas_bitmap;
+    uint8_t last_meas_payload[12];
+    uint8_t last_event_code;
+    uint8_t last_event_len;
+    uint8_t last_event_payload[12];
+} Master_AppRxState;
+
+static Master_AppRxState g_app_rx = {0};
+
 static const uint8_t g_auth_key[16] = {
     0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
     0x91, 0x2B, 0xC4, 0x6E, 0x58, 0xFD, 0x03, 0xAB
@@ -121,6 +135,7 @@ static bool Master_StreamReasmIngest(Master_StreamReassembly *ctx,
                                      const uint8_t *logical_data,
                                      uint8_t logical_len);
 static bool Master_StreamReasmComplete(const Master_StreamReassembly *ctx);
+static void Master_HandleLogicalData(const uint8_t *logical_data, uint8_t logical_len);
 
 /* ========================================================================== */
 /* Hardware initialization                                                     */
@@ -291,6 +306,54 @@ static bool Master_StreamReasmComplete(const Master_StreamReassembly *ctx)
     return ctx->copy_mask != 0U; /* any one of 5 copies is sufficient */
 }
 
+static void Master_HandleLogicalData(const uint8_t *logical_data, uint8_t logical_len)
+{
+    if ((logical_data == NULL) || (logical_len < 4U)) {
+        return;
+    }
+
+    uint8_t stream_seq = logical_data[0];
+    uint8_t app_type   = logical_data[1];
+    uint8_t sub_type   = logical_data[2];
+    uint8_t payload_len = logical_data[3];
+    if (logical_len < (uint8_t)(4U + payload_len)) {
+        return;
+    }
+
+    g_app_rx.last_stream_seq = stream_seq;
+
+    switch (app_type) {
+    case PROTO_APP_TYPE_WAVEFORM:
+        g_app_rx.last_waveform_kind = sub_type;
+        g_app_rx.last_waveform_len =
+            (payload_len > sizeof(g_app_rx.last_waveform_payload))
+            ? (uint8_t)sizeof(g_app_rx.last_waveform_payload)
+            : payload_len;
+        memcpy(g_app_rx.last_waveform_payload, &logical_data[4], g_app_rx.last_waveform_len);
+        break;
+
+    case PROTO_APP_TYPE_MEASUREMENT:
+        g_app_rx.last_meas_bitmap = sub_type;
+        memcpy(g_app_rx.last_meas_payload, &logical_data[4],
+               (payload_len > sizeof(g_app_rx.last_meas_payload))
+               ? sizeof(g_app_rx.last_meas_payload)
+               : payload_len);
+        break;
+
+    case PROTO_APP_TYPE_EVENT:
+        g_app_rx.last_event_code = sub_type;
+        g_app_rx.last_event_len =
+            (payload_len > sizeof(g_app_rx.last_event_payload))
+            ? (uint8_t)sizeof(g_app_rx.last_event_payload)
+            : payload_len;
+        memcpy(g_app_rx.last_event_payload, &logical_data[4], g_app_rx.last_event_len);
+        break;
+
+    default:
+        break;
+    }
+}
+
 static int Master_SendStreamNack(uint8_t missing_from_seq)
 {
     uint8_t nack_args[1] = { missing_from_seq };
@@ -459,6 +522,7 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
         }
 
         if (Master_StreamReasmComplete(&reasm)) {
+            Master_HandleLogicalData(reasm.logical_data, reasm.logical_len);
             last_stream_seq = stream_seq;
             stream_seq_valid = true;
             received++;
