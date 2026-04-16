@@ -106,6 +106,10 @@ extern "C" {
 #define CMD_SLEEP_ACK                0x31U   /* Slave  -> Master            */
 #define CMD_KEEPALIVE                0x40U   /* Master -> Slave             */
 #define CMD_KEEPALIVE_ACK            0x41U   /* Slave  -> Master            */
+#define CMD_STREAM_START             0x50U   /* Master -> Slave             */
+#define CMD_STREAM_STOP              0x51U   /* Master -> Slave             */
+#define CMD_STREAM_ACK               0x52U   /* Slave  -> Master            */
+#define CMD_STREAM_NACK              0x53U   /* Master -> Slave (optional)  */
 
 /* ---------- Status codes (payload byte after command code) ---------- */
 #define PROTO_STATUS_OK              0x00U
