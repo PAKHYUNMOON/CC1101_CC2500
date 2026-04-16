@@ -128,7 +128,7 @@ extern "C" {
  * Every 2.4 GHz wake-up beacon / ACK and every 400 MHz COMMAND / DATA
  * payload carries the 4-byte MASTER_ID so the Slave can reject frames
  * coming from an unauthorised Master.  The Slave stores its authorised
- * Master ID at factory-pairing time (see app/slave/main.c
+ * Master ID at factory-pairing time (see app/slave/s_main.c
  * g_authorized_master_id).  The Master stores its own g_master_id and
  * sends it on every outbound frame; the Slave echoes MASTER_ID on
  * replies for bilateral binding.
