@@ -73,8 +73,14 @@ void LP_EnterStandby(LP_HandleTypeDef *hlp);
 /* Restore system clocks and peripherals after Stop 2 wake-up */
 void LP_RestoreFromStop2(LP_HandleTypeDef *hlp);
 
-/* Configure RTC wake-up timer (seconds) */
+/* Configure RTC wake-up timer (seconds, 1..65535) */
 void LP_ConfigureRTCWakeUp(LP_HandleTypeDef *hlp, uint32_t seconds);
+
+/* Configure RTC wake-up timer with millisecond granularity (1..32000 ms).
+ * Uses RTCCLK/16 = 2048 Hz from LSE 32768 Hz → ~488 µs resolution.
+ * Allows Stop 2 sleep on short intervals such as stream frame periods (≥20 ms)
+ * without busy-polling at 4 MHz between transmissions. */
+void LP_ConfigureRTCWakeUp_ms(LP_HandleTypeDef *hlp, uint32_t ms);
 
 /* Disable RTC wake-up */
 void LP_DisableRTCWakeUp(LP_HandleTypeDef *hlp);
