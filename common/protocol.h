@@ -253,6 +253,24 @@ extern "C" {
 #define PROTO_KEEPALIVE_INTERVAL_MS  5000U
 #define PROTO_SLEEP_CONFIRM_TIMEOUT_MS 200U
 
+/* ---------- UART log options (global) ----------
+ * One place to control runtime text logs in Master / Slave apps.
+ * 0: disable logs, 1: enable logs.
+ *
+ * PROTO_UART_LOG_ENABLE is a global default and can be overridden per-role.
+ */
+#ifndef PROTO_UART_LOG_ENABLE
+#define PROTO_UART_LOG_ENABLE         0
+#endif
+
+#ifndef PROTO_MASTER_UART_LOG_ENABLE
+#define PROTO_MASTER_UART_LOG_ENABLE  PROTO_UART_LOG_ENABLE
+#endif
+
+#ifndef PROTO_SLAVE_UART_LOG_ENABLE
+#define PROTO_SLAVE_UART_LOG_ENABLE   PROTO_UART_LOG_ENABLE
+#endif
+
 /* ==========================================================================
  * Proto_Packet - in-memory representation of one MAC PDU
  * ========================================================================== */
