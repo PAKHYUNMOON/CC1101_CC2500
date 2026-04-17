@@ -125,6 +125,24 @@ static LP_WakeupSource lp_enter_stop_common(LP_HandleTypeDef *hlp,
         __HAL_RTC_WAKEUPTIMER_CLEAR_FLAG(hlp->hrtc, RTC_FLAG_WUTF);
     }
 
+    /* PWR WKUP lines (WUF1..WUF8) — Stop 3 / Standby physical wake */
+    {
+        static const uint32_t s_wkup_pwr_flags[8] = {
+            PWR_WAKEUP_FLAG1, PWR_WAKEUP_FLAG2, PWR_WAKEUP_FLAG3, PWR_WAKEUP_FLAG4,
+            PWR_WAKEUP_FLAG5, PWR_WAKEUP_FLAG6, PWR_WAKEUP_FLAG7, PWR_WAKEUP_FLAG8
+        };
+        bool wkup = false;
+        for (uint32_t i = 0U; i < 8U; i++) {
+            if (__HAL_PWR_GET_FLAG(s_wkup_pwr_flags[i])) {
+                wkup = true;
+                __HAL_PWR_CLEAR_FLAG(s_wkup_pwr_flags[i]);
+            }
+        }
+        if (wkup) {
+            src |= LP_WAKEUP_WKUP_PIN;
+        }
+    }
+
     return src;
 }
 
@@ -260,6 +278,16 @@ void LP_DisableRTCWakeUp(LP_HandleTypeDef *hlp)
     if ((hlp != NULL) && (hlp->hrtc != NULL)) {
         HAL_RTCEx_DeactivateWakeUpTimer(hlp->hrtc);
     }
+}
+
+void LP_EnableWakeUpPin(uint32_t wake_up_pin)
+{
+    HAL_PWR_EnableWakeUpPin(wake_up_pin);
+}
+
+void LP_DisableWakeUpPin(uint32_t wake_up_pin)
+{
+    HAL_PWR_DisableWakeUpPin(wake_up_pin);
 }
 
 /* -------------------------------------------------------------------------- */

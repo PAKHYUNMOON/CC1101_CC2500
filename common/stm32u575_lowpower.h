@@ -30,7 +30,7 @@ extern "C" {
 typedef enum {
     LP_WAKEUP_EXTI_GDO0          = 0x01U,  /* CC2500 GDO0 (beacon/packet received) */
     LP_WAKEUP_RTC_ALARM           = 0x02U,  /* RTC alarm for periodic check / session timeout */
-    LP_WAKEUP_WKUP_PIN            = 0x04U,  /* physical WKUP pin */
+    LP_WAKEUP_WKUP_PIN            = 0x04U,  /* STM32 PWR WKUP (WUF1..WUF8) */
     LP_WAKEUP_EXTI_CC1101_GDO0   = 0x08U,  /* CC1101 GDO0 (MICS packet received, CRC OK) */
 } LP_WakeupSource;
 
@@ -84,6 +84,13 @@ void LP_ConfigureRTCWakeUp_ms(LP_HandleTypeDef *hlp, uint32_t ms);
 
 /* Disable RTC wake-up */
 void LP_DisableRTCWakeUp(LP_HandleTypeDef *hlp);
+
+/* Enable / disable STM32 hardware WKUP pin(s) for Stop 3 / Standby.
+ * `wake_up_pin` is a HAL constant such as PWR_WAKEUP_PIN1_HIGH_0 (PA0).
+ * Call Enable before LP_EnterStop3 when ship mode needs a physical exit;
+ * call Disable when returning to normal Stop 2 + radio WOR. */
+void LP_EnableWakeUpPin(uint32_t wake_up_pin);
+void LP_DisableWakeUpPin(uint32_t wake_up_pin);
 
 /* Disable SPI peripherals before sleep to reduce leakage */
 void LP_SPI_Suspend(LP_HandleTypeDef *hlp);

@@ -133,8 +133,8 @@ extern "C" {
 #define CMD_STREAM_STOP              0x51U   /* Master -> Slave             */
 #define CMD_STREAM_ACK               0x52U   /* Slave  -> Master            */
 #define CMD_STREAM_NACK              0x53U   /* Master -> Slave (optional)  */
-#define CMD_SHIP_CMD                 0x60U   /* Master -> Slave: enter ship/storage mode */
-#define CMD_SHIP_ACK                 0x61U   /* Slave  -> Master            */
+#define CMD_SHIP_CMD                 0x60U   /* Master→Slave: authenticated ship/storage (Stop3+RTC+WKUP) */
+#define CMD_SHIP_ACK                 0x61U   /* Slave→Master: SHIP accepted or status error */
 
 /* ---------- Status codes (payload byte after command code) ---------- */
 #define PROTO_STATUS_OK              0x00U

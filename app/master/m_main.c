@@ -40,6 +40,11 @@
 #define STREAM_LOGICAL_DATA_MAX 17U
 #define STREAM_FEC_COPIES 5U
 
+/* Set to 1 to end a successful session with CMD_SHIP_CMD instead of CMD_SLEEP_CMD. */
+#ifndef MASTER_SESSION_END_WITH_SHIP
+#define MASTER_SESSION_END_WITH_SHIP 0
+#endif
+
 /* ---------- hardware handles ---------- */
 static CC1101_HandleTypeDef g_cc1101;
 static CC2500_HandleTypeDef g_cc2500;
@@ -892,6 +897,103 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
 /* Phase 3: End session                                                        */
 /* ========================================================================== */
 
+static int Master_SendShipCommand(void)
+{
+    Proto_Packet ship_pkt;
+    uint8_t tx_buf[CC1101_PKT_MAX_LEN];
+    uint8_t rx_buf[CC1101_PKT_MAX_LEN];
+    uint8_t rx_len = 0U;
+    uint8_t auth_args[AUTH_ARG_LEN];
+
+    Master_BuildPollAuthArgs(g_session_id, auth_args);
+
+    ship_pkt.fcf  = Proto_FCF_Make(MICS_FCF_TYPE_COMMAND, false, false);
+    ship_pkt.seq  = g_seq++;
+    ship_pkt.sess = g_session_id;
+    ship_pkt.payload_len = Proto_BuildCommandPayload(CMD_SHIP_CMD,
+                                                     g_target_id,
+                                                     g_master_id,
+                                                     auth_args,
+                                                     AUTH_ARG_LEN,
+                                                     ship_pkt.payload,
+                                                     sizeof(ship_pkt.payload));
+    if (ship_pkt.payload_len == 0U) {
+        return -1;
+    }
+
+    uint8_t tx_len = Proto_BuildPacket(&ship_pkt, tx_buf, sizeof(tx_buf));
+    if (tx_len == 0U) {
+        return -1;
+    }
+
+    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
+    if (st != CC1101_OK) {
+        return -2;
+    }
+
+    st = CC1101_WaitAndReadPacket(&g_cc1101,
+                                  g_active_channel,
+                                  rx_buf, &rx_len,
+                                  sizeof(rx_buf),
+                                  PROTO_SLEEP_CONFIRM_TIMEOUT_MS);
+    if (st != CC1101_OK) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -3;
+    }
+
+    Proto_Packet ack_pkt;
+    if (Proto_ParsePacket(rx_buf, rx_len, &ack_pkt) < 0) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -4;
+    }
+    if (!Proto_MatchSession(ack_pkt.sess, g_session_id)) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -5;
+    }
+    if (g_last_rx_seq_valid && !Proto_IsSeqNewer(ack_pkt.seq, g_last_rx_seq)) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -6;
+    }
+    g_last_rx_seq = ack_pkt.seq;
+    g_last_rx_seq_valid = true;
+    if (Proto_FCF_Type(ack_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -7;
+    }
+    if (!Proto_VerifyPayloadDeviceID(&ack_pkt, PROTO_CMD_DEVID_OFFSET, g_target_id) ||
+        !Proto_VerifyPayloadMasterID(&ack_pkt, PROTO_CMD_MASTERID_OFFSET, g_master_id)) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -8;
+    }
+    if (ack_pkt.payload_len < PROTO_CMD_HEADER_LEN) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -9;
+    }
+    if (ack_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] != CMD_SHIP_ACK) {
+        g_session_id = PROTO_SESS_UNASSIGNED;
+        g_last_rx_seq_valid = false;
+        return -10;
+    }
+    if (ack_pkt.payload_len > PROTO_CMD_HEADER_LEN) {
+        if (ack_pkt.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+            g_session_id = PROTO_SESS_UNASSIGNED;
+            g_last_rx_seq_valid = false;
+            return -11;
+        }
+    }
+
+    g_session_id = PROTO_SESS_UNASSIGNED;
+    g_last_rx_seq_valid = false;
+    return 0;
+}
+
 static int Master_SendSleepCommand(void)
 {
     Proto_Packet sleep_pkt;
@@ -992,9 +1094,13 @@ static int Master_CommunicationSession(void)
         (void)Master_ConfigureStreamViaDataWrite(g_stream_interval_ms, g_stream_frame_count);
         (void)Master_StreamFromImplant(g_stream_interval_ms, g_stream_frame_count);
 
-        /* Phase 3: End session - send implant back to sleep */
+        /* Phase 3: End session — sleep (default) or ship/storage mode */
+#if MASTER_SESSION_END_WITH_SHIP
+        rc = Master_SendShipCommand();
+#else
         Master_SendSleepCommand();
         rc = 0;
+#endif
         break;
     }
 

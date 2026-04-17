@@ -44,6 +44,10 @@
  * event (service magnet, factory tester) can trigger immediate exit.      */
 #define SLAVE_SHIP_RTC_INTERVAL_S     3600U  /* 1-hour periodic battery / health check */
 #define SLAVE_SHIP_MAX_CHECKS         720U   /* 720 h = 30 days → auto-exit to NORMAL */
+/* HAL `PWR_WAKEUP_PINx_*` constant — must match CubeMX WKUP pin (default PA0 = WKUP1). */
+#ifndef SLAVE_SHIP_WKUP_HAL_PIN
+#define SLAVE_SHIP_WKUP_HAL_PIN        PWR_WAKEUP_PIN1_HIGH_0
+#endif
 
 typedef enum {
     SLAVE_RUN_NORMAL = 0U,  /* beacon-wait: CC2500 WOR + Stop 2 (default) */
@@ -375,6 +379,9 @@ static void Slave_EnterShipSleep(void)
     /* Hourly RTC wakeup for battery / diagnostics sampling */
     LP_ConfigureRTCWakeUp(&g_lp, SLAVE_SHIP_RTC_INTERVAL_S);
 
+    /* Physical exit from ship: enable STM32 WKUP (Stop 3); cleared when leaving SHIP. */
+    LP_EnableWakeUpPin(SLAVE_SHIP_WKUP_HAL_PIN);
+
     /* Stop 3: ~1 µA — deeper than Stop 2, SRAM retained.
      * Allowed wake sources: RTC wakeup timer + WKUP pin (physical exit). */
     LP_WakeupSource src = LP_EnterStop3(&g_lp);
@@ -395,6 +402,7 @@ static void Slave_EnterShipSleep(void)
         if (g_ship_check_count >= SLAVE_SHIP_MAX_CHECKS) {
             g_power_profile    = SLAVE_RUN_NORMAL;
             g_ship_check_count = 0U;
+            LP_DisableWakeUpPin(SLAVE_SHIP_WKUP_HAL_PIN);
         }
     }
 
@@ -403,6 +411,7 @@ static void Slave_EnterShipSleep(void)
          * Immediately reverts to NORMAL without waiting for auto-exit. */
         g_power_profile    = SLAVE_RUN_NORMAL;
         g_ship_check_count = 0U;
+        LP_DisableWakeUpPin(SLAVE_SHIP_WKUP_HAL_PIN);
     }
 }
 
