@@ -82,7 +82,8 @@ static const uint8_t g_authorized_master_id[PROTO_MASTER_ID_LEN] =
     {0xAA, 0xBB, 0xCC, 0xDD};
 
 /* ---------- session state ---------- */
-static volatile bool g_wakeup_flag = false;
+static volatile bool g_wakeup_flag       = false;
+static volatile bool g_cc1101_gdo0_flag  = false; /* set in EXTI ISR when CC1101 GDO0 asserts */
 static uint8_t g_seq = 0U;
 static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED; /* assigned by Master wake-up */
 static uint8_t g_active_channel = PROTO_CHANNEL_UNASSIGNED; /* MICS channel carried in beacon */
@@ -131,6 +132,9 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
     if (GPIO_Pin == g_cc2500.gdo0_pin) {
         g_wakeup_flag = true;
     }
+    if (GPIO_Pin == g_cc1101.gdo0_pin) {
+        g_cc1101_gdo0_flag = true;
+    }
 }
 
 /* ========================================================================== */
@@ -162,9 +166,14 @@ static void Slave_InitHardware(void)
     /* Low-power handle */
     g_lp.hspi_cc1101 = &hspi1;
     g_lp.hspi_cc2500 = &hspi2;
+    /* CC2500 GDO0 (PB1 / EXTI1): deep-sleep beacon wakeup */
     g_lp.gdo0_port   = g_cc2500.gdo0_port;
     g_lp.gdo0_pin    = g_cc2500.gdo0_pin;
     g_lp.gdo0_irqn   = EXTI1_IRQn;
+    /* CC1101 GDO0 (PB0 / EXTI0): MICS session RX wakeup from Stop 2 */
+    g_lp.cc1101_gdo0_port = g_cc1101.gdo0_port;
+    g_lp.cc1101_gdo0_pin  = g_cc1101.gdo0_pin;
+    g_lp.cc1101_gdo0_irqn = EXTI0_IRQn;
     g_lp.hrtc         = &hrtc;
 
     LP_Init(&g_lp);
@@ -648,15 +657,67 @@ static void Slave_SendResponse(const Proto_Packet *resp, uint8_t channel)
                                -120, 1U, 200U);
 }
 
+/* Validate and dispatch one received MICS command packet.
+ * Returns true if the session should terminate (SLEEP_CMD received). */
+static bool Slave_HandleRxPacket(const uint8_t *rx_buf, uint8_t rx_len)
+{
+    Proto_Packet req_pkt, resp_pkt;
+
+    if (Proto_ParsePacket(rx_buf, rx_len, &req_pkt) < 0) {
+        return false;
+    }
+    if (!Proto_MatchSession(req_pkt.sess, g_session_id)) {
+        return false;
+    }
+    if (g_last_rx_seq_valid && !Proto_IsSeqNewer(req_pkt.seq, g_last_rx_seq)) {
+        return false; /* replay/duplicate/out-of-order */
+    }
+    g_last_rx_seq = req_pkt.seq;
+    g_last_rx_seq_valid = true;
+
+    if (Proto_FCF_Type(req_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
+        return false;
+    }
+    if ((req_pkt.payload_len < PROTO_CMD_HEADER_LEN) ||
+        (req_pkt.payload[PROTO_CMD_DTYPE_OFFSET] != MICS_DTYPE_COMMAND)) {
+        return false;
+    }
+
+    /* Triple-verify the handoff from 2.4 GHz wake-up:
+     *   - SESS (already matched above)
+     *   - DEVICE_ID in payload offset 2..5
+     *   - MASTER_ID in payload offset 6..9
+     * DEVICE_ID proves the Master still knows whom it woke up.
+     * MASTER_ID proves this is the same authorised Master that
+     * initiated the wake-up (and not a concurrent Master guessing
+     * the SESS). Silently drop unauthenticated COMMAND frames so
+     * the attacker gains no side-channel signal. */
+    if (!Proto_VerifyPayloadDeviceID(&req_pkt,
+                                     PROTO_CMD_DEVID_OFFSET,
+                                     g_my_id)) {
+        return false;
+    }
+    if (!Proto_VerifyPayloadMasterID(&req_pkt,
+                                     PROTO_CMD_MASTERID_OFFSET,
+                                     g_authorized_master_id)) {
+        return false;
+    }
+
+    Slave_ProcessCommand(&req_pkt, &resp_pkt);
+    Slave_SendResponse(&resp_pkt, g_active_channel);
+
+    return ((req_pkt.payload_len >= PROTO_CMD_HEADER_LEN) &&
+            (req_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] == CMD_SLEEP_CMD));
+}
+
 static int Slave_HandleMICSSession(void)
 {
     uint8_t rx_buf[CC1101_PKT_MAX_LEN];
     uint8_t rx_len = 0U;
-    Proto_Packet req_pkt, resp_pkt;
     bool session_active = true;
-    uint32_t session_start = HAL_GetTick();
+
     g_slave_pwr_trace.mics_session_count++;
-    g_slave_pwr_trace.last_session_start_ms = session_start;
+    g_slave_pwr_trace.last_session_start_ms = HAL_GetTick();
 
     /* Guard: a valid channel must have been assigned in the wake-up beacon */
     if (g_active_channel >= CC1101_MICS_NUM_CHANNELS) {
@@ -672,90 +733,102 @@ static int Slave_HandleMICSSession(void)
     (void)CC2500_EnterSleep(&g_cc2500);
 
     while (session_active) {
-        /* Check session timeout */
-        if ((HAL_GetTick() - session_start) > PROTO_SESSION_TIMEOUT_MS) {
-            g_slave_pwr_trace.mics_timeout_count++;
-            break;
-        }
+        if (g_stream_enabled) {
+            /*
+             * Active stream mode: HAL_GetTick()-based ms timing is required
+             * for the stream interval (as low as 20 ms).  Busy-poll here —
+             * Stop 2 is not used because the RTC wakeup timer only resolves
+             * to 1-second granularity, which would break stream timing.
+             * HAL_GetTick() is valid here because SysTick is running (no Stop 2).
+             */
+            uint32_t stream_start = HAL_GetTick();
 
-        /* Tune to the channel the Master pre-selected via LBT - no scanning */
-        CC1101_Status st = CC1101_WaitAndReadPacket(&g_cc1101,
-                                                    g_active_channel,
-                                                    rx_buf, &rx_len,
-                                                    sizeof(rx_buf),
-                                                    SLAVE_MICS_RX_WINDOW_MS);
-        if (st != CC1101_OK) {
-            if (g_stream_enabled &&
-                ((HAL_GetTick() - g_last_stream_tx_tick) >= g_stream_interval_ms)) {
-                if (Slave_SendStreamFragments(g_active_channel)) {
-                    g_last_stream_tx_tick = HAL_GetTick();
-                    if (g_stream_remaining_frames > 0U) {
-                        g_stream_remaining_frames--;
-                        if (g_stream_remaining_frames == 0U) {
-                            g_stream_enabled = false;
+            while (g_stream_enabled && session_active) {
+                if ((HAL_GetTick() - stream_start) > PROTO_SESSION_TIMEOUT_MS) {
+                    g_slave_pwr_trace.mics_timeout_count++;
+                    session_active = false;
+                    break;
+                }
+
+                CC1101_Status st = CC1101_WaitAndReadPacket(&g_cc1101,
+                                                            g_active_channel,
+                                                            rx_buf, &rx_len,
+                                                            sizeof(rx_buf),
+                                                            SLAVE_MICS_RX_WINDOW_MS);
+                if (st != CC1101_OK) {
+                    if ((HAL_GetTick() - g_last_stream_tx_tick) >= g_stream_interval_ms) {
+                        if (Slave_SendStreamFragments(g_active_channel)) {
+                            g_last_stream_tx_tick = HAL_GetTick();
+                            if (g_stream_remaining_frames > 0U) {
+                                g_stream_remaining_frames--;
+                                if (g_stream_remaining_frames == 0U) {
+                                    g_stream_enabled = false;
+                                }
+                            }
                         }
                     }
+                    continue;
+                }
+
+                bool end = Slave_HandleRxPacket(rx_buf, rx_len);
+                if (end) {
+                    session_active = false;
+                } else {
+                    stream_start = HAL_GetTick(); /* reset idle timeout on valid traffic */
                 }
             }
-            continue;
-        }
 
-        if (Proto_ParsePacket(rx_buf, rx_len, &req_pkt) < 0) {
-            continue;
-        }
+        } else {
+            /*
+             * Idle command-wait mode: MCU enters Stop 2 with CC1101 in RX.
+             * CC1101 GDO0 EXTI (asserts on CRC-OK packet) wakes the MCU to
+             * read the FIFO — no busy-poll at 4 MHz between exchanges.
+             * RTC alarm fires if no valid packet arrives within the session
+             * timeout, replacing HAL_GetTick() which freezes in Stop 2.
+             *
+             * Architecture:
+             *   1. Set RTC alarm = PROTO_SESSION_TIMEOUT_S
+             *   2. CC1101_EnterRx → radio stays in RX while MCU sleeps
+             *   3. LP_EnterStop2 → ~2 µA until GDO0 EXTI or RTC fires
+             *   4a. CC1101 GDO0 (g_cc1101_gdo0_flag): read packet, process,
+             *       reset RTC alarm for next timeout window
+             *   4b. RTC alarm: session timed out, exit
+             */
+            LP_ConfigureRTCWakeUp(&g_lp, PROTO_SESSION_TIMEOUT_MS / 1000U);
 
-        /* Filter by session ID (1B fast check) */
-        if (!Proto_MatchSession(req_pkt.sess, g_session_id)) {
-            continue;
-        }
-        if (g_last_rx_seq_valid && !Proto_IsSeqNewer(req_pkt.seq, g_last_rx_seq)) {
-            continue; /* replay/duplicate/out-of-order */
-        }
-        g_last_rx_seq = req_pkt.seq;
-        g_last_rx_seq_valid = true;
+            if (CC1101_EnterRx(&g_cc1101, g_active_channel) != CC1101_OK) {
+                /* Radio failed to enter RX — abort session */
+                break;
+            }
 
-        /* Only COMMAND frames are accepted from Master on 400 MHz */
-        if (Proto_FCF_Type(req_pkt.fcf) != MICS_FCF_TYPE_COMMAND) {
-            continue;
-        }
-        if ((req_pkt.payload_len < PROTO_CMD_HEADER_LEN) ||
-            (req_pkt.payload[PROTO_CMD_DTYPE_OFFSET] != MICS_DTYPE_COMMAND)) {
-            continue;
-        }
+            g_cc1101_gdo0_flag = false;
+            (void)LP_EnterStop2(&g_lp);
+            /* --- MCU wakes here (ISRs have already fired) --- */
 
-        /* Triple-verify the handoff from 2.4 GHz wake-up:
-         *   - SESS (already matched above)
-         *   - DEVICE_ID in payload offset 2..5
-         *   - MASTER_ID in payload offset 6..9
-         * DEVICE_ID proves the Master still knows whom it woke up.
-         * MASTER_ID proves this is the same authorised Master that
-         * initiated the wake-up (and not a concurrent Master guessing
-         * the SESS). Silently drop unauthenticated COMMAND frames so
-         * the attacker gains no side-channel signal. */
-        if (!Proto_VerifyPayloadDeviceID(&req_pkt,
-                                         PROTO_CMD_DEVID_OFFSET,
-                                         g_my_id)) {
-            continue;
-        }
-        if (!Proto_VerifyPayloadMasterID(&req_pkt,
-                                         PROTO_CMD_MASTERID_OFFSET,
-                                         g_authorized_master_id)) {
-            continue;
-        }
+            if (g_cc1101_gdo0_flag) {
+                /* CC1101 received a packet: ISR callback set the flag. */
+                g_cc1101_gdo0_flag = false;
 
-        /* Process command and send response on the same channel */
-        Slave_ProcessCommand(&req_pkt, &resp_pkt);
-        Slave_SendResponse(&resp_pkt, g_active_channel);
-
-        /* Check if session should end (SLEEP command) */
-        if ((req_pkt.payload_len >= PROTO_CMD_HEADER_LEN) &&
-            (req_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] == CMD_SLEEP_CMD)) {
-            session_active = false;
+                if (CC1101_ReadPacket(&g_cc1101,
+                                     rx_buf, &rx_len,
+                                     sizeof(rx_buf)) == CC1101_OK) {
+                    bool end = Slave_HandleRxPacket(rx_buf, rx_len);
+                    if (end) {
+                        session_active = false;
+                    }
+                    /* On any valid traffic: RTC is reset at the top of the
+                     * next iteration via LP_ConfigureRTCWakeUp. */
+                }
+            } else {
+                /* No CC1101 packet flag set → woke due to RTC timeout
+                 * (or a spurious wakeup from an unrelated source). */
+                g_slave_pwr_trace.mics_timeout_count++;
+                session_active = false;
+            }
         }
-
-        /* Reset session timer on valid packet */
-        session_start = HAL_GetTick();
     }
+
+    LP_DisableRTCWakeUp(&g_lp);
 
     /* Invalidate session */
     g_session_id     = PROTO_SESS_UNASSIGNED;
