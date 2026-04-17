@@ -28,9 +28,10 @@ extern "C" {
 
 /* ---------- wake-up sources ---------- */
 typedef enum {
-    LP_WAKEUP_EXTI_GDO0  = 0x01U,  /* CC2500 GDO0 (packet received) */
-    LP_WAKEUP_RTC_ALARM   = 0x02U,  /* RTC alarm for periodic check */
-    LP_WAKEUP_WKUP_PIN    = 0x04U,  /* physical WKUP pin */
+    LP_WAKEUP_EXTI_GDO0          = 0x01U,  /* CC2500 GDO0 (beacon/packet received) */
+    LP_WAKEUP_RTC_ALARM           = 0x02U,  /* RTC alarm for periodic check / session timeout */
+    LP_WAKEUP_WKUP_PIN            = 0x04U,  /* physical WKUP pin */
+    LP_WAKEUP_EXTI_CC1101_GDO0   = 0x08U,  /* CC1101 GDO0 (MICS packet received, CRC OK) */
 } LP_WakeupSource;
 
 /* ---------- SPI power state ---------- */
@@ -38,12 +39,17 @@ typedef struct {
     SPI_HandleTypeDef *hspi_cc1101;
     SPI_HandleTypeDef *hspi_cc2500;
 
-    /* CC2500 GDO0 used as EXTI wake-up */
+    /* CC2500 GDO0 used as EXTI wake-up (deep-sleep beacon detection) */
     GPIO_TypeDef *gdo0_port;
     uint16_t      gdo0_pin;
     IRQn_Type     gdo0_irqn;
 
-    /* RTC handle for periodic wake-up */
+    /* CC1101 GDO0 used as EXTI wake-up during MICS session RX (Stop 2) */
+    GPIO_TypeDef *cc1101_gdo0_port;
+    uint16_t      cc1101_gdo0_pin;
+    IRQn_Type     cc1101_gdo0_irqn;
+
+    /* RTC handle for periodic wake-up / session timeout */
     RTC_HandleTypeDef *hrtc;
 } LP_HandleTypeDef;
 
@@ -55,6 +61,10 @@ void LP_Init(LP_HandleTypeDef *hlp);
 /* Enter Stop 2 mode - wakes on configured EXTI or RTC
  * Returns the wake-up source that triggered exit */
 LP_WakeupSource LP_EnterStop2(LP_HandleTypeDef *hlp);
+
+/* Enter Stop 3 mode (~1 uA, deeper than Stop 2, SRAM retained)
+ * Wakes on EXTI or RTC; uses same restore path as Stop 2 */
+LP_WakeupSource LP_EnterStop3(LP_HandleTypeDef *hlp);
 
 /* Enter Standby mode - only WKUP pin or RTC can wake
  * WARNING: SRAM content is lost */

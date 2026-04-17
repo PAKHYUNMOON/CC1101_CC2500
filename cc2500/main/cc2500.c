@@ -366,7 +366,7 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
         { CC2500_SYNC1,    0xD3 },
         { CC2500_SYNC0,    0x91 },
         { CC2500_PKTLEN,   CC2500_PKT_MAX_LEN },
-        { CC2500_PKTCTRL1, 0x04 }, /* APPEND_STATUS=1 */
+        { CC2500_PKTCTRL1, 0x44 }, /* PQT=2 (rejects noise bursts), APPEND_STATUS=1 */
         { CC2500_PKTCTRL0, 0x05 }, /* variable length + CRC */
         { CC2500_ADDR,     0x00 },
         { CC2500_CHANNR,   0x00 },
@@ -389,7 +389,7 @@ CC2500_Status CC2500_InitMICSLike26MHz(CC2500_HandleTypeDef *dev)
         /* Main radio control */
         { CC2500_MCSM2,    0x07 },
         { CC2500_MCSM1,    0x00 }, /* RX/TX end -> IDLE */
-        { CC2500_MCSM0,    0x18 }, /* auto-calibrate on IDLE->RX/TX */
+        { CC2500_MCSM0,    0x38 }, /* calibrate every 4th IDLE->RX/TX transition */
 
         /* FS / AGC */
         { CC2500_FOCCFG,   0x16 },
@@ -475,7 +475,7 @@ CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
         { CC2500_SYNC1,    0xBE }, /* distinct sync word for wake-up */
         { CC2500_SYNC0,    0xEF },
         { CC2500_PKTLEN,   0x0A }, /* max 10 bytes for wake-up packets */
-        { CC2500_PKTCTRL1, 0x04 }, /* APPEND_STATUS=1 */
+        { CC2500_PKTCTRL1, 0x44 }, /* PQT=2 (suppresses WOR false-wakes from noise), APPEND_STATUS=1 */
         { CC2500_PKTCTRL0, 0x05 }, /* variable length + CRC */
         { CC2500_ADDR,     0x00 },
         { CC2500_CHANNR,   CC2500_WAKEUP_CHANNEL },
@@ -495,10 +495,10 @@ CC2500_Status CC2500_InitWakeUp26MHz(CC2500_HandleTypeDef *dev)
         { CC2500_MDMCFG0,  0xF8 }, /* channel spacing */
         { CC2500_DEVIATN,  0x00 }, /* OOK: DEVIATN 무시됨 (상위 nibble 0) */
 
-        /* Main radio control: RX->IDLE after pkt, auto-cal on IDLE->RX/TX */
+        /* Main radio control: RX->IDLE after pkt, cal every 4th IDLE->RX/TX */
         { CC2500_MCSM2,    0x07 },
         { CC2500_MCSM1,    0x00 }, /* CCA=always, RX/TX->IDLE */
-        { CC2500_MCSM0,    0x18 }, /* auto-calibrate on IDLE->RX/TX */
+        { CC2500_MCSM0,    0x38 }, /* calibrate every 4th IDLE->RX/TX transition */
 
         /* FS / AGC */
         { CC2500_FOCCFG,   0x16 },

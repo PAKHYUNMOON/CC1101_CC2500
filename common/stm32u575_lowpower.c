@@ -22,6 +22,11 @@ void LP_Init(LP_HandleTypeDef *hlp)
         return;
     }
 
+    /* Enable instruction cache: reduces flash-read stalls at 4 MHz MSI,
+     * cutting active current during radio driver execution. */
+    __HAL_RCC_ICACHE_CLK_ENABLE();
+    ICACHE->CR |= ICACHE_CR_EN_Msk;
+
     /* Enable PWR clock */
     __HAL_RCC_PWR_CLK_ENABLE();
 
@@ -41,6 +46,21 @@ void LP_Init(LP_HandleTypeDef *hlp)
         HAL_NVIC_EnableIRQ(hlp->gdo0_irqn);
     }
 
+    /* Configure CC1101 GDO0 as EXTI wake-up source (rising edge).
+     * Used to wake MCU from Stop 2 during MICS session RX without
+     * busy-polling at 4 MHz — GDO0 asserts only on CRC-OK packet. */
+    if (hlp->cc1101_gdo0_port != NULL) {
+        GPIO_InitTypeDef gpio = {0};
+        gpio.Pin   = hlp->cc1101_gdo0_pin;
+        gpio.Mode  = GPIO_MODE_IT_RISING;
+        gpio.Pull  = GPIO_PULLDOWN;
+        gpio.Speed = GPIO_SPEED_FREQ_LOW;
+        HAL_GPIO_Init(hlp->cc1101_gdo0_port, &gpio);
+
+        HAL_NVIC_SetPriority(hlp->cc1101_gdo0_irqn, 0, 0);
+        HAL_NVIC_EnableIRQ(hlp->cc1101_gdo0_irqn);
+    }
+
     /* Enable ultra-low power mode: VREFINT off in Stop 2 */
     HAL_PWREx_EnableUltraLowPowerMode();
 
@@ -53,40 +73,50 @@ void LP_Init(LP_HandleTypeDef *hlp)
 /* Stop 2 entry/exit                                                           */
 /* -------------------------------------------------------------------------- */
 
-LP_WakeupSource LP_EnterStop2(LP_HandleTypeDef *hlp)
+/* Internal helper: common Stop entry/exit logic shared by Stop 2 and Stop 3.
+ * Caller passes the HAL enter function to use. */
+static LP_WakeupSource lp_enter_stop_common(LP_HandleTypeDef *hlp,
+                                             void (*enter_fn)(uint8_t))
 {
-    if (hlp == NULL) {
-        return 0U;
-    }
-
-    /* Suspend SPI peripherals to reduce leakage */
     LP_SPI_Suspend(hlp);
 
-    /* Clear all wake-up flags */
     __HAL_PWR_CLEAR_FLAG(PWR_FLAG_WU);
 
-    /* Ensure all pending interrupts are cleared */
+    /* Clear all configured EXTI pending bits before sleeping so a stale
+     * assertion from before the WFI doesn't immediately re-wake the core. */
     __HAL_GPIO_EXTI_CLEAR_IT(hlp->gdo0_pin);
+    if (hlp->cc1101_gdo0_port != NULL) {
+        __HAL_GPIO_EXTI_CLEAR_IT(hlp->cc1101_gdo0_pin);
+    }
 
-    /* Suspend SysTick to avoid unnecessary wake-ups */
     HAL_SuspendTick();
 
-    /* Enter Stop 2: voltage regulator in low-power, flash off */
-    HAL_PWREx_EnterSTOP2Mode(PWR_STOPENTRY_WFI);
+    enter_fn(PWR_STOPENTRY_WFI);
 
-    /* --- MCU wakes up here --- */
+    /* --- MCU wakes up here; ISRs fire before next C statement --- */
 
     HAL_ResumeTick();
-
-    /* Restore clocks and peripherals */
     LP_RestoreFromStop2(hlp);
 
-    /* Determine wake-up source */
+    /* Wake-source detection: ISRs (CC2500/CC1101 EXTI callbacks, RTC handler)
+     * run between WFI and here and will have cleared the EXTI/RTC pending bits.
+     * We therefore rely on the volatile flags set inside those ISR callbacks
+     * (g_wakeup_flag for CC2500, g_cc1101_gdo0_flag for CC1101) at the
+     * application layer.  The LP source bits are set here only for the RTC
+     * whose WUTF flag is cleared by HAL_RTCEx_WakeUpTimerIRQHandler; if that
+     * handler is not registered the flag is still set and we pick it up here.
+     * Either way the application can also check its own g_*_flag variables. */
     LP_WakeupSource src = 0U;
 
     if (__HAL_GPIO_EXTI_GET_IT(hlp->gdo0_pin) != 0U) {
         src |= LP_WAKEUP_EXTI_GDO0;
         __HAL_GPIO_EXTI_CLEAR_IT(hlp->gdo0_pin);
+    }
+
+    if ((hlp->cc1101_gdo0_port != NULL) &&
+        (__HAL_GPIO_EXTI_GET_IT(hlp->cc1101_gdo0_pin) != 0U)) {
+        src |= LP_WAKEUP_EXTI_CC1101_GDO0;
+        __HAL_GPIO_EXTI_CLEAR_IT(hlp->cc1101_gdo0_pin);
     }
 
     if ((hlp->hrtc != NULL) &&
@@ -96,6 +126,22 @@ LP_WakeupSource LP_EnterStop2(LP_HandleTypeDef *hlp)
     }
 
     return src;
+}
+
+LP_WakeupSource LP_EnterStop2(LP_HandleTypeDef *hlp)
+{
+    if (hlp == NULL) {
+        return 0U;
+    }
+    return lp_enter_stop_common(hlp, HAL_PWREx_EnterSTOP2Mode);
+}
+
+LP_WakeupSource LP_EnterStop3(LP_HandleTypeDef *hlp)
+{
+    if (hlp == NULL) {
+        return 0U;
+    }
+    return lp_enter_stop_common(hlp, HAL_PWREx_EnterSTOP3Mode);
 }
 
 void LP_RestoreFromStop2(LP_HandleTypeDef *hlp)
