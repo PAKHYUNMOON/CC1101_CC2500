@@ -94,7 +94,6 @@ static bool    g_stream_enabled = false;
 static uint8_t g_stream_interval_ms = 20U;
 static uint8_t g_stream_remaining_frames = 0U;
 static uint8_t g_stream_seq = 0U;
-static uint32_t g_last_stream_tx_tick = 0U;
 
 static const uint8_t g_auth_key[16] = {
     0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
@@ -575,7 +574,6 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
         }
         g_stream_enabled = (g_stream_remaining_frames > 0U);
         g_stream_seq = 0U;
-        g_last_stream_tx_tick = HAL_GetTick();
 
         uint8_t st = PROTO_STATUS_OK;
         slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
@@ -735,46 +733,75 @@ static int Slave_HandleMICSSession(void)
     while (session_active) {
         if (g_stream_enabled) {
             /*
-             * Active stream mode: HAL_GetTick()-based ms timing is required
-             * for the stream interval (as low as 20 ms).  Busy-poll here —
-             * Stop 2 is not used because the RTC wakeup timer only resolves
-             * to 1-second granularity, which would break stream timing.
-             * HAL_GetTick() is valid here because SysTick is running (no Stop 2).
+             * Stream mode with Stop 2 + ms-precision RTC wakeup.
+             *
+             * Problem with HAL_GetTick(): SysTick stops in Stop 2, so ms
+             * timing cannot rely on it.  HAL_GetTick() and busy-polling are
+             * therefore replaced here too.
+             *
+             * Solution — LP_ConfigureRTCWakeUp_ms():
+             *   RTCCLK/16 = 32768/16 = 2048 Hz → ~488 µs/tick.
+             *   stream_interval_ms=20 → count=41 ticks → 41/2048 ≈ 20 ms.
+             *   MCU sleeps in Stop 2 for exactly one stream period per loop
+             *   iteration instead of spinning at 4 MHz for 50 ms windows.
+             *
+             * Wakeup semantics per iteration:
+             *   RTC fires (g_cc1101_gdo0_flag==false): stream interval elapsed
+             *     → send stream fragments; CC1101 auto-returns to RX (MCSM1
+             *     TXOFF→RX) so no explicit CC1101_EnterRx is needed mid-session.
+             *   CC1101 GDO0 fires (g_cc1101_gdo0_flag==true): command arrived
+             *     mid-stream → read and process; both events can fire in the
+             *     same wakeup (RTC during TX completion window).
+             *
+             * Session timeout: accumulated elapsed ms replaces HAL_GetTick().
              */
-            uint32_t stream_start = HAL_GetTick();
+            uint32_t stream_elapsed_ms = 0U;
 
             while (g_stream_enabled && session_active) {
-                if ((HAL_GetTick() - stream_start) > PROTO_SESSION_TIMEOUT_MS) {
+                LP_ConfigureRTCWakeUp_ms(&g_lp, (uint32_t)g_stream_interval_ms);
+
+                if (CC1101_EnterRx(&g_cc1101, g_active_channel) != CC1101_OK) {
+                    session_active = false;
+                    break;
+                }
+
+                g_cc1101_gdo0_flag = false;
+                (void)LP_EnterStop2(&g_lp);
+                /* --- ISRs have fired; SPI restored --- */
+
+                /* Advance software timeout counter by one stream period */
+                stream_elapsed_ms += (uint32_t)g_stream_interval_ms;
+                if (stream_elapsed_ms > PROTO_SESSION_TIMEOUT_MS) {
                     g_slave_pwr_trace.mics_timeout_count++;
                     session_active = false;
                     break;
                 }
 
-                CC1101_Status st = CC1101_WaitAndReadPacket(&g_cc1101,
-                                                            g_active_channel,
-                                                            rx_buf, &rx_len,
-                                                            sizeof(rx_buf),
-                                                            SLAVE_MICS_RX_WINDOW_MS);
-                if (st != CC1101_OK) {
-                    if ((HAL_GetTick() - g_last_stream_tx_tick) >= g_stream_interval_ms) {
-                        if (Slave_SendStreamFragments(g_active_channel)) {
-                            g_last_stream_tx_tick = HAL_GetTick();
-                            if (g_stream_remaining_frames > 0U) {
-                                g_stream_remaining_frames--;
-                                if (g_stream_remaining_frames == 0U) {
-                                    g_stream_enabled = false;
-                                }
+                if (!g_cc1101_gdo0_flag) {
+                    /* Woke due to RTC: stream interval elapsed → transmit */
+                    if (Slave_SendStreamFragments(g_active_channel)) {
+                        if (g_stream_remaining_frames > 0U) {
+                            g_stream_remaining_frames--;
+                            if (g_stream_remaining_frames == 0U) {
+                                g_stream_enabled = false;
                             }
                         }
                     }
-                    continue;
                 }
 
-                bool end = Slave_HandleRxPacket(rx_buf, rx_len);
-                if (end) {
-                    session_active = false;
-                } else {
-                    stream_start = HAL_GetTick(); /* reset idle timeout on valid traffic */
+                if (g_cc1101_gdo0_flag) {
+                    /* CC1101 received a command during stream */
+                    g_cc1101_gdo0_flag = false;
+                    if (CC1101_ReadPacket(&g_cc1101,
+                                         rx_buf, &rx_len,
+                                         sizeof(rx_buf)) == CC1101_OK) {
+                        bool end = Slave_HandleRxPacket(rx_buf, rx_len);
+                        if (end) {
+                            session_active = false;
+                        } else {
+                            stream_elapsed_ms = 0U; /* valid traffic resets timeout */
+                        }
+                    }
                 }
             }
 

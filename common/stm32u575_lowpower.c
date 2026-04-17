@@ -225,6 +225,36 @@ void LP_ConfigureRTCWakeUp(LP_HandleTypeDef *hlp, uint32_t seconds)
     }
 }
 
+void LP_ConfigureRTCWakeUp_ms(LP_HandleTypeDef *hlp, uint32_t ms)
+{
+    if ((hlp == NULL) || (hlp->hrtc == NULL) || (ms == 0U)) {
+        return;
+    }
+
+    HAL_RTCEx_DeactivateWakeUpTimer(hlp->hrtc);
+
+    if (ms <= 32000U) {
+        /*
+         * RTCCLK/16 clock source: 32768 Hz / 16 = 2048 Hz → ~488 µs/tick.
+         * count = ms × 2048 / 1000.  WakeUpTimer fires after (count) ticks,
+         * so actual delay = count / 2048 s ≈ ms × 1 ms.
+         * Example: ms=20 → count=41 → 41/2048 ≈ 20.0 ms.
+         */
+        uint32_t count = (ms * 2048U) / 1000U;
+        if (count == 0U) { count = 1U; }
+        if (count > 0xFFFFU) { count = 0xFFFFU; }
+        HAL_RTCEx_SetWakeUpTimer_IT(hlp->hrtc, count - 1U,
+                                    RTC_WAKEUPCLOCK_RTCCLK_DIV16);
+    } else {
+        /* Beyond 32 s fall back to 1 Hz CK_SPRE (same as LP_ConfigureRTCWakeUp) */
+        uint32_t count = (ms / 1000U);
+        if (count == 0U) { count = 1U; }
+        if (count > 0xFFFFU) { count = 0xFFFFU; }
+        HAL_RTCEx_SetWakeUpTimer_IT(hlp->hrtc, count - 1U,
+                                    RTC_WAKEUPCLOCK_CK_SPRE_16BITS);
+    }
+}
+
 void LP_DisableRTCWakeUp(LP_HandleTypeDef *hlp)
 {
     if ((hlp != NULL) && (hlp->hrtc != NULL)) {
