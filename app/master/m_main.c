@@ -29,6 +29,7 @@
 #include "cc2500.h"
 #include "protocol.h"
 #include "stm32u575_lowpower.h"
+#include "stm32u575zi_UART.h"
 #include <string.h>
 
 #define AUTH_NONCE_LEN 4U
@@ -43,6 +44,16 @@
 /* Set to 1 to end a successful session with CMD_SHIP_CMD instead of CMD_SLEEP_CMD. */
 #ifndef MASTER_SESSION_END_WITH_SHIP
 #define MASTER_SESSION_END_WITH_SHIP 0
+#endif
+
+/* UART log option is centralized in common/protocol.h:
+ *   PROTO_UART_LOG_ENABLE / PROTO_MASTER_UART_LOG_ENABLE */
+#if PROTO_MASTER_UART_LOG_ENABLE
+extern UART_HandleTypeDef huart1; /* Change to your USB-UART instance if needed */
+#define MASTER_UART_LOG_PORT (&huart1)
+#define MASTER_LOG(...)      (void)STM32U575ZI_UART_Printf(MASTER_UART_LOG_PORT, __VA_ARGS__)
+#else
+#define MASTER_LOG(...)      do { } while (0)
 #endif
 
 /* ---------- hardware handles ---------- */
@@ -1051,6 +1062,8 @@ static int Master_CommunicationSession(void)
    uint8_t data_buf[PROTO_MAX_PAYLOAD];
    uint8_t data_len = 0U;
 
+   MASTER_LOG("[MASTER] session start\r\n");
+
    /* Outer session-restart loop (Patch B).
     *
     * If same-channel LBT keeps failing on the MICS channel we announced
@@ -1108,6 +1121,8 @@ static int Master_CommunicationSession(void)
    CC1101_EnterSleep(&g_cc1101);
    CC2500_EnterSleep(&g_cc2500);
 
+    MASTER_LOG("[MASTER] session end rc=%d\r\n", rc);
+
    return rc;
 }
 
@@ -1123,6 +1138,7 @@ int main(void)
    /* MX_GPIO_Init(), MX_SPI1_Init(), MX_SPI2_Init(), MX_RTC_Init() */
 
    Master_InitHardware();
+   MASTER_LOG("[MASTER] boot ok (UART log=%d)\r\n", PROTO_MASTER_UART_LOG_ENABLE);
 
    while (1) {
        /*
@@ -1137,9 +1153,11 @@ int main(void)
        if (result == 0) {
            /* Session successful */
            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);  /* LED on */
+           MASTER_LOG("[MASTER] session success\r\n");
        } else {
            /* Session failed */
            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+           MASTER_LOG("[MASTER] session fail rc=%d\r\n", result);
        }
 
        /* Wait before next session (or wait for user trigger) */
