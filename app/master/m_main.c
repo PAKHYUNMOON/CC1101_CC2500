@@ -35,6 +35,8 @@
 #define AUTH_NONCE_LEN 4U
 #define AUTH_TAG_LEN   4U
 #define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
+#define STREAM_FRAME_COUNTER_LEN 2U
+#define STREAM_AUTH_LEN (STREAM_FRAME_COUNTER_LEN + AUTH_TAG_LEN)
 #define STREAM_CFG_SUBCMD 0x01U
 #define STREAM_USE_OPTIONAL_NACK 0U
 #define STREAM_NACK_MIN_GAP 2U
@@ -278,7 +280,35 @@ static bool Master_VerifyPollDataAuth(const Proto_Packet *pkt, uint8_t body_off)
 
 static bool Master_VerifyStreamDataAuth(const Proto_Packet *pkt, uint8_t body_off)
 {
-   return Master_VerifyPollDataAuth(pkt, body_off);
+    if (pkt->payload_len < (uint8_t)(body_off + STREAM_AUTH_LEN + 4U)) {
+        return false;
+    }
+ 
+    const uint8_t *frame_ctr = &pkt->payload[body_off];
+    const uint8_t *tag_b = &pkt->payload[body_off + STREAM_FRAME_COUNTER_LEN];
+    const uint8_t *stream_meta = &pkt->payload[body_off + STREAM_AUTH_LEN];
+    uint8_t logical_len = stream_meta[3];
+    if (pkt->payload_len < (uint8_t)(body_off + STREAM_AUTH_LEN + 4U + logical_len)) {
+        return false;
+    }
+ 
+    uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 4U + STREAM_LOGICAL_DATA_MAX];
+    mac_input[0] = g_session_id;
+    memcpy(&mac_input[1], g_target_id, PROTO_DEVICE_ID_LEN);
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_master_id, PROTO_MASTER_ID_LEN);
+    mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN] = frame_ctr[0];
+    mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + 1U] = frame_ctr[1];
+    memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN],
+           stream_meta,
+           (uint8_t)(4U + logical_len));
+ 
+    uint32_t expect = Master_Mac32(mac_input,
+                                   (uint8_t)(1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 4U + logical_len));
+    uint32_t got = ((uint32_t)tag_b[0]) |
+                   ((uint32_t)tag_b[1] << 8) |
+                   ((uint32_t)tag_b[2] << 16) |
+                   ((uint32_t)tag_b[3] << 24);
+    return expect == got;
 }
 
 static bool Master_StreamReasmIngest(Master_StreamReassembly *ctx,
@@ -477,6 +507,8 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
    uint8_t received = 0U;
    bool stream_seq_valid = false;
    uint8_t last_stream_seq = 0U;
+   bool frame_ctr_valid = false;
+   uint16_t last_frame_ctr = 0U;
    Master_StreamReassembly reasm = {0};
    while (received < frame_count) {
        if (CC1101_WaitAndReadPacket(&g_cc1101, g_active_channel,
@@ -508,15 +540,23 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
            continue;
        }
        /* DATA body(copy-FEC mode):
-        * NONCE(4) + TAG(4) + stream_seq(1) + copy_idx(1) + copy_total(1) + logical_len(1) + logical_data */
-       if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 4U)) {
-           continue;
+        * frame_counter(2) + TAG(4) + stream_seq(1) + copy_idx(1) + copy_total(1) + logical_len(1) + logical_data */       if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 4U)) {
+       if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 4U)) {
+            continue;
        }
-       uint8_t stream_seq = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN];
-       uint8_t copy_idx = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 1U];
-       uint8_t copy_total = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 2U];
-       uint8_t logical_len = data_pkt.payload[PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 3U];
-       uint8_t logical_data_off = (uint8_t)(PROTO_DATA_BODY_OFFSET + AUTH_ARG_LEN + 4U);
+       uint16_t frame_ctr = ((uint16_t)data_pkt.payload[PROTO_DATA_BODY_OFFSET]) |
+                            ((uint16_t)data_pkt.payload[PROTO_DATA_BODY_OFFSET + 1U] << 8);
+       if (frame_ctr_valid) {
+           uint16_t delta = (uint16_t)(frame_ctr - last_frame_ctr);
+           if ((delta == 0U) || (delta > 32768U)) {
+               continue; /* duplicate / old frame counter */
+           }
+       }
+       uint8_t stream_seq = data_pkt.payload[PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN];
+       uint8_t copy_idx = data_pkt.payload[PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 1U];
+       uint8_t copy_total = data_pkt.payload[PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 2U];
+       uint8_t logical_len = data_pkt.payload[PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 3U];
+       uint8_t logical_data_off = (uint8_t)(PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 4U);
        if (data_pkt.payload_len < (uint8_t)(logical_data_off + logical_len)) {
            continue;
        }
@@ -541,6 +581,8 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
            Master_HandleLogicalData(reasm.logical_data, reasm.logical_len);
            last_stream_seq = stream_seq;
            stream_seq_valid = true;
+           frame_ctr_valid = true;
+           last_frame_ctr = frame_ctr;
            received++;
            memset(&reasm, 0, sizeof(reasm));
        }

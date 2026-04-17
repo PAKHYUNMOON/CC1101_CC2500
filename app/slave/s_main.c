@@ -30,7 +30,11 @@
 #define AUTH_NONCE_LEN 4U
 #define AUTH_TAG_LEN   4U
 #define AUTH_ARG_LEN   (AUTH_NONCE_LEN + AUTH_TAG_LEN)
+#define STREAM_FRAME_COUNTER_LEN 2U
+#define STREAM_AUTH_LEN (STREAM_FRAME_COUNTER_LEN + AUTH_TAG_LEN)
 #define STREAM_CFG_SUBCMD 0x01U
+#define STREAM_USE_OPTIONAL_NACK 0U
+#define STREAM_NACK_MIN_GAP 2U
 #define STREAM_LOGICAL_DATA_MAX 17U
 #define STREAM_FEC_COPIES 5U
 
@@ -131,8 +135,12 @@ static const uint8_t g_authorized_master_id[PROTO_MASTER_ID_LEN] =
    {0xAA, 0xBB, 0xCC, 0xDD};
 
 /* ---------- session state ---------- */
+#define SLAVE_ISR_WAKE_CC2500_GDO0   (1UL << 0)
+#define SLAVE_ISR_WAKE_CC1101_GDO0   (1UL << 1)
+#define SLAVE_ISR_WAKE_RTC           (1UL << 2)
+
+static volatile uint32_t g_isr_wake_flags = 0U;
 static volatile bool g_wakeup_flag       = false;
-static volatile bool g_cc1101_gdo0_flag  = false; /* set in EXTI ISR when CC1101 GDO0 asserts */
 
 /* ---------- ship mode runtime state ---------- */
 static SlavePowerProfile g_power_profile  = SLAVE_RUN_NORMAL;
@@ -149,6 +157,7 @@ static bool    g_stream_enabled = false;
 static uint8_t g_stream_interval_ms = 20U;
 static uint8_t g_stream_remaining_frames = 0U;
 static uint8_t g_stream_seq = 0U;
+static uint16_t g_stream_frame_counter = 0U;
 
 static const uint8_t g_auth_key[16] = {
    0x3A, 0x5C, 0x19, 0xE7, 0xA2, 0x4D, 0x77, 0x10,
@@ -177,6 +186,23 @@ static uint8_t Slave_BuildPollDataBody(uint8_t *out, uint8_t out_size);
 static bool Slave_VerifyCmdAuthAndStoreNonce(const Proto_Packet *req);
 static uint8_t Slave_BuildStreamDataBody(uint8_t *out, uint8_t out_size);
 static bool Slave_SendStreamFragments(uint8_t channel);
+static uint32_t Slave_ISR_PopWakeFlags(void);
+static bool Slave_IsWakeFlagSet(uint32_t flags, uint32_t bit);
+
+static uint32_t Slave_ISR_PopWakeFlags(void)
+{
+   uint32_t flags;
+   __disable_irq();
+   flags = g_isr_wake_flags;
+   g_isr_wake_flags = 0U;
+   __enable_irq();
+   return flags;
+}
+
+static bool Slave_IsWakeFlagSet(uint32_t flags, uint32_t bit)
+{
+   return (flags & bit) != 0U;
+}
 
 /* ========================================================================== */
 /* EXTI callback - CC2500 GDO0 wake-up interrupt                              */
@@ -185,12 +211,22 @@ static bool Slave_SendStreamFragments(uint8_t channel);
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
    if (GPIO_Pin == g_cc2500.gdo0_pin) {
-       g_wakeup_flag = true;
+        g_isr_wake_flags |= SLAVE_ISR_WAKE_CC2500_GDO0;
    }
    if (GPIO_Pin == g_cc1101.gdo0_pin) {
-       g_cc1101_gdo0_flag = true;
+    g_isr_wake_flags |= SLAVE_ISR_WAKE_CC1101_GDO0;
+   }
+   if (GPIO_Pin == GPIO_PIN_1) { /* RTC alarm */
+       g_isr_wake_flags |= SLAVE_ISR_WAKE_RTC;
    }
 }
+
+void HAL_RTCEx_WakeUpTimerEventCallback(RTC_HandleTypeDef *hrtc_cb)
+{
+   (void)hrtc_cb;
+   g_isr_wake_flags |= SLAVE_ISR_WAKE_RTC;
+}
+
 
 /* ========================================================================== */
 /* Hardware initialization                                                     */
@@ -349,23 +385,34 @@ static bool Slave_SendStreamFragments(uint8_t channel)
    }
 
    for (uint8_t copy_idx = 0U; copy_idx < STREAM_FEC_COPIES; copy_idx++) {
-       uint8_t body[AUTH_ARG_LEN + 4U + STREAM_LOGICAL_DATA_MAX];
-       memcpy(body, g_session_nonce, AUTH_NONCE_LEN);
-       uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + AUTH_NONCE_LEN];
+       uint8_t body[STREAM_AUTH_LEN + 4U + STREAM_LOGICAL_DATA_MAX];
+       uint16_t frame_counter = g_stream_frame_counter;
+       uint8_t mac_input[1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 4U + STREAM_LOGICAL_DATA_MAX];
+       body[0] = (uint8_t)(frame_counter & 0xFFU);
+       body[1] = (uint8_t)((frame_counter >> 8) & 0xFFU);
        mac_input[0] = g_session_id;
        memcpy(&mac_input[1], g_my_id, PROTO_DEVICE_ID_LEN);
        memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN], g_authorized_master_id, PROTO_MASTER_ID_LEN);
-       memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN], g_session_nonce, AUTH_NONCE_LEN);
-       uint32_t tag = Slave_Mac32(mac_input, sizeof(mac_input));
-       body[4] = (uint8_t)(tag & 0xFFU);
-       body[5] = (uint8_t)((tag >> 8) & 0xFFU);
-       body[6] = (uint8_t)((tag >> 16) & 0xFFU);
-       body[7] = (uint8_t)((tag >> 24) & 0xFFU);
-       body[AUTH_ARG_LEN] = logical[0]; /* stream_seq */
-       body[AUTH_ARG_LEN + 1U] = copy_idx;
-       body[AUTH_ARG_LEN + 2U] = STREAM_FEC_COPIES;
-       body[AUTH_ARG_LEN + 3U] = logical_len;
-       memcpy(&body[AUTH_ARG_LEN + 4U], logical, logical_len);
+       mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN] = body[0];
+       mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + 1U] = body[1];
+       mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN] = logical[0]; /* stream_seq */
+       mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 1U] = copy_idx;
+       mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 2U] = STREAM_FEC_COPIES;
+       mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 3U] = logical_len;
+       memcpy(&mac_input[1 + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 4U],
+              logical, logical_len);
+
+       uint32_t tag = Slave_Mac32(mac_input,
+                                  (uint8_t)(1U + PROTO_DEVICE_ID_LEN + PROTO_MASTER_ID_LEN + STREAM_FRAME_COUNTER_LEN + 4U + logical_len));
+       body[2] = (uint8_t)(tag & 0xFFU);
+       body[3] = (uint8_t)((tag >> 8) & 0xFFU);
+       body[4] = (uint8_t)((tag >> 16) & 0xFFU);
+       body[5] = (uint8_t)((tag >> 24) & 0xFFU);
+       body[STREAM_AUTH_LEN] = logical[0]; /* stream_seq */
+       body[STREAM_AUTH_LEN + 1U] = copy_idx;
+       body[STREAM_AUTH_LEN + 2U] = STREAM_FEC_COPIES;
+       body[STREAM_AUTH_LEN + 3U] = logical_len;
+       memcpy(&body[STREAM_AUTH_LEN + 4U], logical, logical_len); 
 
        Proto_Packet pkt;
        pkt.fcf = Proto_FCF_Make(MICS_FCF_TYPE_DATA, false, true);
@@ -375,7 +422,7 @@ static bool Slave_SendStreamFragments(uint8_t channel)
                                                 g_my_id,
                                                 g_authorized_master_id,
                                                 body,
-                                                (uint8_t)(AUTH_ARG_LEN + 4U + logical_len),
+                                                (uint8_t)(STREAM_AUTH_LEN + 4U + logical_len),
                                                 pkt.payload,
                                                 sizeof(pkt.payload));
        if (pkt.payload_len == 0U) {
@@ -383,6 +430,7 @@ static bool Slave_SendStreamFragments(uint8_t channel)
        }
        Slave_SendResponse(&pkt, channel);
    }
+   g_stream_frame_counter++;
 
    return true;
 }
@@ -497,17 +545,19 @@ static void Slave_EnterDeepSleep(void)
     *   - CC2500 GDO0 EXTI (beacon received)
     *   - RTC wake-up timer (periodic self-check)
     */
-   LP_WakeupSource src = LP_EnterStop2(&g_lp);
+   (void)LP_EnterStop2(&g_lp);
+
 
    /* --- MCU wakes up here --- */
    g_slave_pwr_trace.last_stop2_exit_ms = HAL_GetTick();
+   uint32_t wake_flags = Slave_ISR_PopWakeFlags();
 
-   if (src & LP_WAKEUP_EXTI_GDO0) {
+   if (Slave_IsWakeFlagSet(wake_flags, SLAVE_ISR_WAKE_CC2500_GDO0)) {
        g_wakeup_flag = true;
        g_slave_pwr_trace.wakeup_exti_count++;
    }
 
-   if (src & LP_WAKEUP_RTC_ALARM) {
+   if (Slave_IsWakeFlagSet(wake_flags, SLAVE_ISR_WAKE_RTC)) {
        g_slave_pwr_trace.wakeup_rtc_count++;
        /* Periodic self-check: battery level, sensor status, etc.
         * If nothing to do, go back to sleep immediately */
@@ -713,7 +763,8 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
        }
        g_stream_enabled = (g_stream_remaining_frames > 0U);
        g_stream_seq = 0U;
-
+       g_stream_frame_counter = 0U;
+       
        uint8_t st = PROTO_STATUS_OK;
        slave_build_cmd_response(resp, CMD_STREAM_ACK, &st, 1U);
        break;
@@ -933,9 +984,15 @@ static int Slave_HandleMICSSession(void)
                    break;
                }
 
-               g_cc1101_gdo0_flag = false;
                (void)LP_EnterStop2(&g_lp);
                /* --- ISRs have fired; SPI restored --- */
+
+               uint32_t wake_flags = Slave_ISR_PopWakeFlags();
+
+               if (Slave_IsWakeFlagSet(wake_flags, SLAVE_ISR_WAKE_CC1101_GDO0)) {
+                   g_wakeup_flag = true;
+                   g_slave_pwr_trace.wakeup_exti_count++;
+               }
 
                /* Advance software timeout counter by one stream period */
                stream_elapsed_ms += (uint32_t)g_stream_interval_ms;
@@ -947,7 +1004,7 @@ static int Slave_HandleMICSSession(void)
                    break;
                }
 
-               if (!g_cc1101_gdo0_flag) {
+               if (!cc1101_woke_flag){
                    /* Woke due to RTC: stream interval elapsed → transmit */
                    if (Slave_SendStreamFragments(g_active_channel)) {
                        if (g_stream_remaining_frames > 0U) {
@@ -959,9 +1016,8 @@ static int Slave_HandleMICSSession(void)
                    }
                }
 
-               if (g_cc1101_gdo0_flag) {
+               if (!cc1101_woke_flag) {
                    /* CC1101 received a command during stream */
-                   g_cc1101_gdo0_flag = false;
                    if (CC1101_ReadPacket(&g_cc1101,
                                         rx_buf, &rx_len,
                                         sizeof(rx_buf)) == CC1101_OK) {
@@ -998,14 +1054,12 @@ static int Slave_HandleMICSSession(void)
                break;
            }
 
-           g_cc1101_gdo0_flag = false;
            (void)LP_EnterStop2(&g_lp);
            /* --- MCU wakes here (ISRs have already fired) --- */
+           uint32_t wake_flags = Slave_ISR_PopWakeFlags();
 
-           if (g_cc1101_gdo0_flag) {
+           if (Slave_IsWakeFlagSet(wake_flags, SLAVE_ISR_WAKE_CC1101_GDO0)) {
                /* CC1101 received a packet: ISR callback set the flag. */
-               g_cc1101_gdo0_flag = false;
-
                if (CC1101_ReadPacket(&g_cc1101,
                                     rx_buf, &rx_len,
                                     sizeof(rx_buf)) == CC1101_OK) {

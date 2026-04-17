@@ -98,14 +98,10 @@ static LP_WakeupSource lp_enter_stop_common(LP_HandleTypeDef *hlp,
     HAL_ResumeTick();
     LP_RestoreFromStop2(hlp);
 
-    /* Wake-source detection: ISRs (CC2500/CC1101 EXTI callbacks, RTC handler)
-     * run between WFI and here and will have cleared the EXTI/RTC pending bits.
-     * We therefore rely on the volatile flags set inside those ISR callbacks
-     * (g_wakeup_flag for CC2500, g_cc1101_gdo0_flag for CC1101) at the
-     * application layer.  The LP source bits are set here only for the RTC
-     * whose WUTF flag is cleared by HAL_RTCEx_WakeUpTimerIRQHandler; if that
-     * handler is not registered the flag is still set and we pick it up here.
-     * Either way the application can also check its own g_*_flag variables. */
+    /* NOTE:
+     * Application wake-source arbitration should use explicit ISR-owned flags
+     * as the single source of truth. Hardware status bits below are best-effort
+     * diagnostics only and may already be cleared by HAL IRQ handlers. */
     LP_WakeupSource src = 0U;
 
     if (__HAL_GPIO_EXTI_GET_IT(hlp->gdo0_pin) != 0U) {
