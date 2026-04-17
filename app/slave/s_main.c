@@ -37,6 +37,19 @@
 #define SLAVE_RTC_WAKEUP_INTERVAL_S   300U  /* raise to reduce periodic wakeups */
 #define SLAVE_MICS_RX_WINDOW_MS       50U   /* lower to reduce active RX duty */
 
+/* ---------- ship mode (long-term storage / transport) ----------
+ * In ship mode CC2500 WOR is disabled entirely; both radios enter SPWD.
+ * MCU runs Stop 3 (~1 µA) and wakes only via RTC for hourly diagnostics.
+ * Auto-exit fires after SLAVE_SHIP_MAX_CHECKS (30 days); a physical WKUP
+ * event (service magnet, factory tester) can trigger immediate exit.      */
+#define SLAVE_SHIP_RTC_INTERVAL_S     3600U  /* 1-hour periodic battery / health check */
+#define SLAVE_SHIP_MAX_CHECKS         720U   /* 720 h = 30 days → auto-exit to NORMAL */
+
+typedef enum {
+    SLAVE_RUN_NORMAL = 0U,  /* beacon-wait: CC2500 WOR + Stop 2 (default) */
+    SLAVE_RUN_SHIP   = 1U,  /* storage:     CC2500/CC1101 Sleep + Stop 3  */
+} SlavePowerProfile;
+
 /* ---------- power trace (debugger-readable) ---------- */
 typedef struct {
     uint32_t stop2_entries;
@@ -50,6 +63,9 @@ typedef struct {
     uint32_t last_stop2_exit_ms;
     uint32_t last_session_start_ms;
     uint32_t last_session_end_ms;
+    /* ship mode counters */
+    uint32_t ship_entries;       /* times ship mode was entered */
+    uint32_t ship_check_count;   /* total hourly wake-ups inside ship mode */
 } Slave_PowerTrace;
 
 volatile Slave_PowerTrace g_slave_pwr_trace = {0};
@@ -84,6 +100,10 @@ static const uint8_t g_authorized_master_id[PROTO_MASTER_ID_LEN] =
 /* ---------- session state ---------- */
 static volatile bool g_wakeup_flag       = false;
 static volatile bool g_cc1101_gdo0_flag  = false; /* set in EXTI ISR when CC1101 GDO0 asserts */
+
+/* ---------- ship mode runtime state ---------- */
+static SlavePowerProfile g_power_profile  = SLAVE_RUN_NORMAL;
+static uint32_t          g_ship_check_count = 0U; /* hourly wake-up counter inside ship mode */
 static uint8_t g_seq = 0U;
 static uint8_t g_session_id     = PROTO_SESS_UNASSIGNED; /* assigned by Master wake-up */
 static uint8_t g_active_channel = PROTO_CHANNEL_UNASSIGNED; /* MICS channel carried in beacon */
@@ -110,6 +130,7 @@ static uint8_t g_sensor_data[16] = {
 
 /* ---------- forward declarations ---------- */
 static void Slave_InitHardware(void);
+static void Slave_EnterShipSleep(void);
 static void Slave_EnterDeepSleep(void);
 static int  Slave_HandleWakeUp(void);
 static int  Slave_HandleMICSSession(void);
@@ -332,11 +353,71 @@ static bool Slave_SendStreamFragments(uint8_t channel)
 }
 
 /* ========================================================================== */
+/* Ship mode sleep  (long-term storage / transport)                            */
+/*                                                                             */
+/* Differences from normal deep sleep:                                         */
+/*   - CC2500 in Sleep (SPWD), NOT WOR → no 500 ms sniff current              */
+/*   - MCU in Stop 3 (~1 µA) instead of Stop 2                                */
+/*   - RTC interval = 1 hour (battery / health check only)                    */
+/*   - Exit via: auto-counter (30 days) or physical WKUP event                */
+/* ========================================================================== */
+
+static void Slave_EnterShipSleep(void)
+{
+    g_slave_pwr_trace.ship_entries++;
+    g_slave_pwr_trace.last_stop2_enter_ms = HAL_GetTick();
+
+    /* Both radios into hard Sleep: WOR is intentionally disabled in ship mode.
+     * CC2500 GDO0 EXTI is still wired but the radio will not assert it. */
+    CC1101_EnterSleep(&g_cc1101);
+    CC2500_EnterSleep(&g_cc2500);
+
+    /* Hourly RTC wakeup for battery / diagnostics sampling */
+    LP_ConfigureRTCWakeUp(&g_lp, SLAVE_SHIP_RTC_INTERVAL_S);
+
+    /* Stop 3: ~1 µA — deeper than Stop 2, SRAM retained.
+     * Allowed wake sources: RTC wakeup timer + WKUP pin (physical exit). */
+    LP_WakeupSource src = LP_EnterStop3(&g_lp);
+
+    g_slave_pwr_trace.last_stop2_exit_ms = HAL_GetTick();
+
+    if (src & LP_WAKEUP_RTC_ALARM) {
+        g_ship_check_count++;
+        g_slave_pwr_trace.ship_check_count++;
+        g_slave_pwr_trace.wakeup_rtc_count++;
+
+        /* Periodic diagnostic: record timestamp / battery proxy */
+        g_sensor_data[8] = (uint8_t)(g_ship_check_count & 0xFFU);
+
+        /* Auto-exit after SLAVE_SHIP_MAX_CHECKS (720 h = 30 days).
+         * On the next main-loop iteration the profile is NORMAL,
+         * so Slave_EnterDeepSleep() will re-arm CC2500 WOR and Stop 2. */
+        if (g_ship_check_count >= SLAVE_SHIP_MAX_CHECKS) {
+            g_power_profile    = SLAVE_RUN_NORMAL;
+            g_ship_check_count = 0U;
+        }
+    }
+
+    if (src & LP_WAKEUP_WKUP_PIN) {
+        /* Physical exit event: service magnet, factory-tester pin, etc.
+         * Immediately reverts to NORMAL without waiting for auto-exit. */
+        g_power_profile    = SLAVE_RUN_NORMAL;
+        g_ship_check_count = 0U;
+    }
+}
+
+/* ========================================================================== */
 /* Deep sleep entry (main idle state)                                          */
 /* ========================================================================== */
 
 static void Slave_EnterDeepSleep(void)
 {
+    /* Dispatch to ship FSM when in storage/transport mode */
+    if (g_power_profile == SLAVE_RUN_SHIP) {
+        Slave_EnterShipSleep();
+        return;
+    }
+
     g_slave_pwr_trace.stop2_entries++;
     g_slave_pwr_trace.last_stop2_enter_ms = HAL_GetTick();
 
@@ -624,6 +705,24 @@ static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
         slave_build_cmd_response(resp, CMD_SLEEP_ACK, NULL, 0U);
         break;
 
+    case CMD_SHIP_CMD:
+    {
+        /* Authenticated ship-mode entry: require the same nonce/MAC as
+         * other session commands so an attacker cannot force the implant
+         * into storage mode via a spoofed packet. */
+        if (!Slave_VerifyCmdAuthAndStoreNonce(req)) {
+            uint8_t st = PROTO_STATUS_ERR_ID_MISMATCH;
+            slave_build_cmd_response(resp, CMD_SHIP_ACK, &st, 1U);
+            break;
+        }
+        /* Transition is deferred until after the ACK is transmitted
+         * (Slave_HandleRxPacket ends the session on CMD_SHIP_CMD). */
+        g_power_profile    = SLAVE_RUN_SHIP;
+        g_ship_check_count = 0U;
+        slave_build_cmd_response(resp, CMD_SHIP_ACK, NULL, 0U);
+        break;
+    }
+
     case CMD_KEEPALIVE:
         slave_build_cmd_response(resp, CMD_KEEPALIVE_ACK, NULL, 0U);
         break;
@@ -704,8 +803,15 @@ static bool Slave_HandleRxPacket(const uint8_t *rx_buf, uint8_t rx_len)
     Slave_ProcessCommand(&req_pkt, &resp_pkt);
     Slave_SendResponse(&resp_pkt, g_active_channel);
 
-    return ((req_pkt.payload_len >= PROTO_CMD_HEADER_LEN) &&
-            (req_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] == CMD_SLEEP_CMD));
+    if (req_pkt.payload_len < PROTO_CMD_HEADER_LEN) {
+        return false;
+    }
+    uint8_t end_cmd = req_pkt.payload[PROTO_CMD_SUBCMD_OFFSET];
+    /* Both SLEEP and SHIP commands terminate the MICS session immediately
+     * after the ACK is sent.  For SHIP, g_power_profile was already set to
+     * SLAVE_RUN_SHIP inside Slave_ProcessCommand() so the next deep-sleep
+     * entry will dispatch to Slave_EnterShipSleep(). */
+    return (end_cmd == CMD_SLEEP_CMD) || (end_cmd == CMD_SHIP_CMD);
 }
 
 static int Slave_HandleMICSSession(void)
