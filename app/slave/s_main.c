@@ -24,6 +24,7 @@
 #include "cc2500.h"
 #include "protocol.h"
 #include "stm32u575_lowpower.h"
+#include "stm32u575zi_UART.h"
 #include <string.h>
 
 #define AUTH_NONCE_LEN 4U
@@ -32,6 +33,16 @@
 #define STREAM_CFG_SUBCMD 0x01U
 #define STREAM_LOGICAL_DATA_MAX 17U
 #define STREAM_FEC_COPIES 5U
+
+/* UART log option is centralized in common/protocol.h:
+ *   PROTO_UART_LOG_ENABLE / PROTO_SLAVE_UART_LOG_ENABLE */
+#if PROTO_SLAVE_UART_LOG_ENABLE
+extern UART_HandleTypeDef huart1; /* Change to your USB-UART instance if needed */
+#define SLAVE_UART_LOG_PORT (&huart1)
+#define SLAVE_LOG(...)      (void)STM32U575ZI_UART_Printf(SLAVE_UART_LOG_PORT, __VA_ARGS__)
+#else
+#define SLAVE_LOG(...)      do { } while (0)
+#endif
 
 /* ---------- low-power tuning knobs ---------- */
 #define SLAVE_RTC_WAKEUP_INTERVAL_S   300U  /* raise to reduce periodic wakeups */
@@ -870,6 +881,9 @@ static int Slave_HandleMICSSession(void)
 
    g_slave_pwr_trace.mics_session_count++;
    g_slave_pwr_trace.last_session_start_ms = HAL_GetTick();
+   SLAVE_LOG("[SLAVE] mics session start ch=%u sess=%u\r\n",
+             (unsigned)g_active_channel,
+             (unsigned)g_session_id);
 
    /* Guard: a valid channel must have been assigned in the wake-up beacon */
    if (g_active_channel >= CC1101_MICS_NUM_CHANNELS) {
@@ -1021,6 +1035,8 @@ static int Slave_HandleMICSSession(void)
    g_stream_enabled = false;
    g_stream_remaining_frames = 0U;
    g_slave_pwr_trace.last_session_end_ms = HAL_GetTick();
+   SLAVE_LOG("[SLAVE] mics session end timeout_cnt=%lu\r\n",
+             (unsigned long)g_slave_pwr_trace.mics_timeout_count);
    return 0;
 }
 
@@ -1036,6 +1052,7 @@ int main(void)
    /* MX_GPIO_Init(), MX_SPI1_Init(), MX_SPI2_Init(), MX_RTC_Init() */
 
    Slave_InitHardware();
+   SLAVE_LOG("[SLAVE] boot ok (UART log=%d)\r\n", PROTO_SLAVE_UART_LOG_ENABLE);
 
    /* Put CC1101 to sleep at startup (not needed until communication) */
    CC1101_EnterSleep(&g_cc1101);
@@ -1056,10 +1073,14 @@ int main(void)
 
            if (rc == 0) {
                g_slave_pwr_trace.wakeup_ok_count++;
+               SLAVE_LOG("[SLAVE] wakeup ok sess=%u ch=%u\r\n",
+                         (unsigned)g_session_id,
+                         (unsigned)g_active_channel);
                /* Wake-up successful - enter MICS data session */
                Slave_HandleMICSSession();
            } else {
                g_slave_pwr_trace.wakeup_fail_count++;
+               SLAVE_LOG("[SLAVE] wakeup fail rc=%d\r\n", rc);
            }
 
            /* Session done or wake-up failed - return to deep sleep */
