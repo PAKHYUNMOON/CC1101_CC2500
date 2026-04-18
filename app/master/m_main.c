@@ -40,7 +40,7 @@
 #define STREAM_CFG_SUBCMD 0x01U
 #define STREAM_USE_OPTIONAL_NACK 0U
 #define STREAM_NACK_MIN_GAP 2U
-#define STREAM_LOGICAL_DATA_MAX 17U
+#define STREAM_LOGICAL_DATA_MAX 20U
 #define STREAM_FEC_COPIES 5U
 
 /* Set to 1 to end a successful session with CMD_SHIP_CMD instead of CMD_SLEEP_CMD. */
@@ -540,7 +540,7 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
            continue;
        }
        /* DATA body(copy-FEC mode):
-        * frame_counter(2) + TAG(4) + stream_seq(1) + copy_idx(1) + copy_total(1) + logical_len(1) + logical_data */       if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 4U)) {
+        * frame_counter(2) + TAG(4) + stream_seq(1) + copy_idx(1) + copy_total(1) + logical_len(1) + logical_data */
        if (data_pkt.payload_len < (uint8_t)(PROTO_DATA_BODY_OFFSET + STREAM_AUTH_LEN + 4U)) {
             continue;
        }
@@ -927,7 +927,7 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
    /* Verify DEVICE_ID + MASTER_ID handoff in ACK */
    if (!Proto_VerifyPayloadDeviceID(&ack_pkt, PROTO_CMD_DEVID_OFFSET,
                                     g_target_id)) {
-       return -8;
+       return -9;
    }
    if (!Proto_VerifyPayloadMasterID(&ack_pkt, PROTO_CMD_MASTERID_OFFSET,
                                     g_master_id)) {

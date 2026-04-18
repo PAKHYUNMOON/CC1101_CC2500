@@ -25,7 +25,7 @@ HAL_StatusTypeDef STM32U575ZI_UART_SendBytes(UART_HandleTypeDef *huart,
         return HAL_ERROR;
     }
 
-    return HAL_UART_Transmit(huart, (uint8_t *)data, len, STM32U575ZI_UART_TX_TIMEOUT_MS);
+    return HAL_UART_Transmit(huart, (uint8_t *)(uintptr_t)data, len, STM32U575ZI_UART_TX_TIMEOUT_MS);
 }
 
 HAL_StatusTypeDef STM32U575ZI_UART_SendString(UART_HandleTypeDef *huart,
@@ -47,7 +47,7 @@ HAL_StatusTypeDef STM32U575ZI_UART_SendString(UART_HandleTypeDef *huart,
     }
 
     return HAL_UART_Transmit(huart,
-                             (uint8_t *)str,
+                             (uint8_t *)(uintptr_t)str,
                              (uint16_t)len,
                              STM32U575ZI_UART_TX_TIMEOUT_MS);
 }

@@ -35,7 +35,7 @@
 #define STREAM_CFG_SUBCMD 0x01U
 #define STREAM_USE_OPTIONAL_NACK 0U
 #define STREAM_NACK_MIN_GAP 2U
-#define STREAM_LOGICAL_DATA_MAX 17U
+#define STREAM_LOGICAL_DATA_MAX 20U
 #define STREAM_FEC_COPIES 5U
 
 /* UART log option is centralized in common/protocol.h:
@@ -697,8 +697,8 @@ static void slave_build_cmd_response(Proto_Packet *resp,
 
 static int Slave_ProcessCommand(const Proto_Packet *req, Proto_Packet *resp)
 {
-   /* Session is already validated by caller; just echo SESS */
-   resp->seq  = req->seq;
+   /* Use slave's own seq counter for responses (separate from master's space) */
+   resp->seq  = g_seq++;
    resp->sess = g_session_id;
 
    /* All inbound COMMAND packets: payload = [DTYPE, SUBCMD, DEVID[4], args] */
@@ -1004,7 +1004,7 @@ static int Slave_HandleMICSSession(void)
                    break;
                }
 
-               if (!cc1101_woke_flag){
+               if (!Slave_IsWakeFlagSet(wake_flags, SLAVE_ISR_WAKE_CC1101_GDO0)) {
                    /* Woke due to RTC: stream interval elapsed → transmit */
                    if (Slave_SendStreamFragments(g_active_channel)) {
                        if (g_stream_remaining_frames > 0U) {
@@ -1016,7 +1016,7 @@ static int Slave_HandleMICSSession(void)
                    }
                }
 
-               if (!cc1101_woke_flag) {
+               if (Slave_IsWakeFlagSet(wake_flags, SLAVE_ISR_WAKE_CC1101_GDO0)) {
                    /* CC1101 received a command during stream */
                    if (CC1101_ReadPacket(&g_cc1101,
                                         rx_buf, &rx_len,
