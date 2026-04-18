@@ -31,7 +31,7 @@ extern "C" {
  *   LEN and CRC are handled by CC1101/CC2500 hardware
  *   (PKTCTRL0.LENGTH_CONFIG=variable, CRC_EN=1).
  *
- *   Maximum LEN field = 63 (FCF+SEQ+SESS+PAYLOAD bytes after LEN).
+ *   Maximum LEN field = 61 (FCF+SEQ+SESS+PAYLOAD bytes after LEN; = PKTLEN).
  *   With PKTLEN=61 → PAYLOAD up to 58B (non-FEC).
  *   With FEC enabled and extended buffering → up to 105B application data.
  *
