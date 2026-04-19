@@ -259,21 +259,16 @@ extern "C" {
  *   PROTO_UART_LOG_DISABLE  = 0  (로그 off)
  *
  * 설정 방법 (common/protocol.h 에서만 수정):
- *   전체 on  : PROTO_UART_LOG 를 PROTO_UART_LOG_ENABLE 로 변경
- *   전체 off : PROTO_UART_LOG 를 PROTO_UART_LOG_DISABLE 로 변경
- *   Master만 on: PROTO_MASTER_UART_LOG_ENABLE 을 PROTO_UART_LOG_ENABLE 로 직접 변경
- *
- * 예시) Master on, Slave off:
- *   #define PROTO_UART_LOG                PROTO_UART_LOG_DISABLE
- *   #define PROTO_MASTER_UART_LOG_ENABLE  PROTO_UART_LOG_ENABLE
- *   #define PROTO_SLAVE_UART_LOG_ENABLE   PROTO_UART_LOG_DISABLE
+ *   모두 off    : 둘 다 PROTO_UART_LOG_DISABLE
+ *   모두 on     : 둘 다 PROTO_UART_LOG_ENABLE
+ *   Master만 on : MASTER=PROTO_UART_LOG_ENABLE,  SLAVE=PROTO_UART_LOG_DISABLE
+ *   Slave만  on : MASTER=PROTO_UART_LOG_DISABLE, SLAVE=PROTO_UART_LOG_ENABLE
  * ----------------------------------------------------------------------- */
 #define PROTO_UART_LOG_DISABLE        0   /* 로그 off 상태 상수 — 값 변경 금지 */
 #define PROTO_UART_LOG_ENABLE         1   /* 로그 on  상태 상수 — 값 변경 금지 */
 
-#define PROTO_UART_LOG                PROTO_UART_LOG_DISABLE   /* 전역 기본값 */
-#define PROTO_MASTER_UART_LOG_ENABLE  PROTO_UART_LOG           /* Master 로그 */
-#define PROTO_SLAVE_UART_LOG_ENABLE   PROTO_UART_LOG           /* Slave  로그 */
+#define PROTO_MASTER_UART_LOG_ENABLE  PROTO_UART_LOG_DISABLE   /* Master 로그: ENABLE/DISABLE 선택 */
+#define PROTO_SLAVE_UART_LOG_ENABLE   PROTO_UART_LOG_DISABLE   /* Slave  로그: ENABLE/DISABLE 선택 */
 
 /* ==========================================================================
  * Proto_Packet - in-memory representation of one MAC PDU
