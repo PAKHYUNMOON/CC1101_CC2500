@@ -881,6 +881,9 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
    if (ftype == MICS_FCF_TYPE_DATA) {
        data_off = (uint8_t)(data_off + AUTH_ARG_LEN);
    }
+   if (resp_pkt.payload_len < data_off) {
+    return -12;
+   }
    uint8_t n = (uint8_t)(resp_pkt.payload_len - data_off);
    uint8_t dtype = 0xFFU; /* sentinel for empty body */
    if (n > 0U) {
