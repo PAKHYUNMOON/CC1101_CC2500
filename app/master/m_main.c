@@ -537,6 +537,8 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
            continue;
        }
        if (!Master_VerifyStreamDataAuth(&data_pkt, PROTO_DATA_BODY_OFFSET)) {
+           MASTER_LOG("[MASTER] stream_auth_fail seq=%u\r\n",
+                      (unsigned)data_pkt.seq);
            continue;
        }
        /* DATA body(copy-FEC mode):
@@ -560,6 +562,9 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
        if (data_pkt.payload_len < (uint8_t)(logical_data_off + logical_len)) {
            continue;
        }
+       MASTER_LOG("[MASTER] stream_rx seq=%u copy=%u/%u fc=%u\r\n",
+                  (unsigned)stream_seq, (unsigned)copy_idx,
+                  (unsigned)copy_total, (unsigned)frame_ctr);
        if (!Master_StreamReasmIngest(&reasm, stream_seq, copy_idx, copy_total,
                                      &data_pkt.payload[logical_data_off], logical_len)) {
            continue;
@@ -578,6 +583,9 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
        }
 
        if (Master_StreamReasmComplete(&reasm)) {
+           MASTER_LOG("[MASTER] stream_reassembled seq=%u len=%u app=%02X\r\n",
+                      (unsigned)stream_seq, (unsigned)reasm.logical_len,
+                      (unsigned)(reasm.logical_len > 1U ? reasm.logical_data[1] : 0U));
            Master_HandleLogicalData(reasm.logical_data, reasm.logical_len);
            last_stream_seq = stream_seq;
            stream_seq_valid = true;
@@ -618,12 +626,19 @@ static CC1101_Status Master_TxLBT_SameChannel(const uint8_t *tx_buf,
            /* Non-CCA failure (SPI / HW) - retry won't help */
            return st;
        }
+       MASTER_LOG("[MASTER] lbt_retry ch=%u attempt=%u/%u\r\n",
+                  (unsigned)g_active_channel,
+                  (unsigned)(attempt + 1U),
+                  (unsigned)MASTER_SAME_CH_RETRIES);
        /* Pseudo-random back-off: mix seq counter with attempt index to
         * de-correlate colliding Masters. Bounded: [MASTER_SAME_CH_BACKOFF_MS
         * .. MASTER_SAME_CH_BACKOFF_MS + 7]. */
        uint32_t jitter = ((uint32_t)g_seq + attempt) & 0x07U;
        HAL_Delay(MASTER_SAME_CH_BACKOFF_MS + jitter);
    }
+   MASTER_LOG("[MASTER] lbt_fail ch=%u all %u retries failed\r\n",
+              (unsigned)g_active_channel,
+              (unsigned)MASTER_SAME_CH_RETRIES);
    return st;   /* CC1101_ERR_CCA */
 }
 
@@ -684,6 +699,10 @@ static int Master_WakeUpImplant(void)
    }
 
    /* 4) Repeatedly transmit the beacon so at least one WOR window catches it */
+   MASTER_LOG("[MASTER] beacon_tx ch=%u sess=%u dev=%02X%02X%02X%02X mid=%02X%02X%02X%02X\r\n",
+              (unsigned)g_active_channel, (unsigned)proposed_sess,
+              g_target_id[0], g_target_id[1], g_target_id[2], g_target_id[3],
+              g_master_id[0], g_master_id[1], g_master_id[2], g_master_id[3]);
    CC2500_Status st = CC2500_SendWakeUpBeacon(&g_cc2500,
                                               tx_buf, tx_len,
                                               PROTO_WAKEUP_BEACON_REPEAT);
@@ -743,6 +762,12 @@ static int Master_WakeUpImplant(void)
    /* 7) Session established */
    g_session_id = proposed_sess;
    g_last_rx_seq_valid = false;
+   MASTER_LOG("[MASTER] beacon_ack_ok sess=%u ch=%u dev=%02X%02X%02X%02X\r\n",
+              (unsigned)g_session_id, (unsigned)g_active_channel,
+              ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 0U],
+              ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 1U],
+              ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 2U],
+              ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 3U]);
    return 0;
 }
 
@@ -787,6 +812,9 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
 
    /* Same-channel LBT: retry CCA on the pre-announced channel, do NOT hop.
     * If every retry fails, caller restarts the session (new LBT channel). */
+   MASTER_LOG("[MASTER] poll_req_tx seq=%u sess=%u nonce=%02X%02X%02X%02X\r\n",
+              (unsigned)poll_pkt.seq, (unsigned)poll_pkt.sess,
+              auth_args[0], auth_args[1], auth_args[2], auth_args[3]);
    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
    if (st != CC1101_OK) {
        return -2;
@@ -846,8 +874,13 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
        return -10;
    }
    if (ftype == MICS_FCF_TYPE_DATA && !Master_VerifyPollDataAuth(&resp_pkt, body_off)) {
+       MASTER_LOG("[MASTER] poll_resp_auth_fail seq=%u\r\n", (unsigned)resp_pkt.seq);
        return -11;
    }
+   MASTER_LOG("[MASTER] poll_resp_ok seq=%u dtype=%02X len=%u\r\n",
+              (unsigned)resp_pkt.seq,
+              (unsigned)resp_pkt.payload[0],
+              (unsigned)resp_pkt.payload_len);
    if ((resp_buf != NULL) && (resp_len != NULL)) {
        uint8_t data_off = body_off;
        if (ftype == MICS_FCF_TYPE_DATA) {
@@ -894,6 +927,8 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
    }
 
    /* Same-channel LBT retry (never hop - Slave is camped on this channel) */
+   MASTER_LOG("[MASTER] data_write_tx seq=%u sess=%u len=%u\r\n",
+              (unsigned)write_pkt.seq, (unsigned)write_pkt.sess, (unsigned)len);
    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
    if (st != CC1101_OK) {
        return -3;
@@ -939,7 +974,10 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
    if (ack_pkt.payload[PROTO_CMD_SUBCMD_OFFSET] != CMD_DATA_ACK) {
        return -11;
    }
+   MASTER_LOG("[MASTER] data_ack_ok seq=%u\r\n", (unsigned)ack_pkt.seq);
    if (ack_pkt.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+       MASTER_LOG("[MASTER] data_ack_fail status=%02X\r\n",
+                  (unsigned)ack_pkt.payload[PROTO_CMD_ARGS_OFFSET]);
        return -12;
    }
 
@@ -1073,6 +1111,7 @@ static int Master_SendSleepCommand(void)
    }
 
    /* Same-channel LBT retry (no hop) */
+   MASTER_LOG("[MASTER] sleep_cmd_tx sess=%u\r\n", (unsigned)sleep_pkt.sess);
    CC1101_Status st = Master_TxLBT_SameChannel(tx_buf, tx_len);
    if (st != CC1101_OK) {
        return -2;
@@ -1131,6 +1170,8 @@ static int Master_CommunicationSession(void)
             * after our LBT. Restart the session so we re-run LBT and
             * pick a different channel. Slave will session-timeout or be
             * re-woken with the new channel. */
+           MASTER_LOG("[MASTER] session_restart attempt=%u/%u (lbt_cca_fail)\r\n",
+                      (unsigned)(attempt + 1U), (unsigned)MASTER_SESSION_RESTARTS);
            g_session_id = PROTO_SESS_UNASSIGNED;
            continue;
        }

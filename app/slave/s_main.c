@@ -428,6 +428,10 @@ static bool Slave_SendStreamFragments(uint8_t channel)
        if (pkt.payload_len == 0U) {
            return false;
        }
+       SLAVE_LOG("[SLAVE] stream_tx seq=%u copy=%u/%u fc=%u\r\n",
+                 (unsigned)logical[0], (unsigned)copy_idx,
+                 (unsigned)STREAM_FEC_COPIES,
+                 (unsigned)frame_counter);
        Slave_SendResponse(&pkt, channel);
    }
    g_stream_frame_counter++;
@@ -644,6 +648,17 @@ static int Slave_HandleWakeUp(void)
    g_last_rx_seq_valid = false;
    memset(g_session_nonce, 0, sizeof(g_session_nonce));
 
+   SLAVE_LOG("[SLAVE] beacon_rx dev=%02X%02X%02X%02X mid=%02X%02X%02X%02X ch=%u sess=%u\r\n",
+             beacon.payload[PROTO_BEACON_DEVID_OFFSET + 0U],
+             beacon.payload[PROTO_BEACON_DEVID_OFFSET + 1U],
+             beacon.payload[PROTO_BEACON_DEVID_OFFSET + 2U],
+             beacon.payload[PROTO_BEACON_DEVID_OFFSET + 3U],
+             beacon.payload[PROTO_BEACON_MASTERID_OFFSET + 0U],
+             beacon.payload[PROTO_BEACON_MASTERID_OFFSET + 1U],
+             beacon.payload[PROTO_BEACON_MASTERID_OFFSET + 2U],
+             beacon.payload[PROTO_BEACON_MASTERID_OFFSET + 3U],
+             (unsigned)g_active_channel, (unsigned)g_session_id);
+
    /* 9) Build and send wake-up ACK: echo DEVICE_ID + MASTER_ID +
     *    SESS + CHANNEL so Master can verify bilateral binding. */
    Proto_Packet ack;
@@ -674,6 +689,8 @@ static int Slave_HandleWakeUp(void)
        return -13;
    }
 
+   SLAVE_LOG("[SLAVE] beacon_ack_tx sess=%u ch=%u\r\n",
+             (unsigned)g_session_id, (unsigned)g_active_channel);
    return 0;
 }
 
@@ -910,7 +927,12 @@ static bool Slave_HandleRxPacket(const uint8_t *rx_buf, uint8_t rx_len)
        return false;
    }
 
+   SLAVE_LOG("[SLAVE] cmd_rx seq=%u sess=%u sub=%02X\r\n",
+             (unsigned)req_pkt.seq, (unsigned)req_pkt.sess,
+             (unsigned)req_pkt.payload[PROTO_CMD_SUBCMD_OFFSET]);
    Slave_ProcessCommand(&req_pkt, &resp_pkt);
+   SLAVE_LOG("[SLAVE] cmd_resp_tx sub=%02X\r\n",
+             (unsigned)resp_pkt.payload[PROTO_CMD_SUBCMD_OFFSET]);
    Slave_SendResponse(&resp_pkt, g_active_channel);
 
    if (req_pkt.payload_len < PROTO_CMD_HEADER_LEN) {
