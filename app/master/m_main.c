@@ -537,6 +537,7 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
            continue;
        }
        if (!Master_VerifyStreamDataAuth(&data_pkt, PROTO_DATA_BODY_OFFSET)) {
+           MASTER_LOG("[MASTER] stream_auth_fail seq=%u\r\n", data_pkt.seq);
            continue;
        }
        /* DATA body(copy-FEC mode):
@@ -564,6 +565,8 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
                                      &data_pkt.payload[logical_data_off], logical_len)) {
            continue;
        }
+       MASTER_LOG("[MASTER] stream_rx seq=%u copy=%u/%u fc=%u\r\n",
+           stream_seq, copy_idx, copy_total, frame_ctr);
 
        if (stream_seq_valid) {
            uint8_t expected = (uint8_t)(last_stream_seq + 1U);
@@ -578,6 +581,9 @@ static int Master_StreamFromImplant(uint8_t interval_ms, uint8_t frame_count)
        }
 
        if (Master_StreamReasmComplete(&reasm)) {
+           MASTER_LOG("[MASTER] stream_reassembled seq=%u len=%u app=%02X\r\n",
+               stream_seq, reasm.logical_len,
+               (reasm.logical_len > 1U) ? reasm.logical_data[1] : 0U);
            Master_HandleLogicalData(reasm.logical_data, reasm.logical_len);
            last_stream_seq = stream_seq;
            stream_seq_valid = true;
@@ -618,12 +624,16 @@ static CC1101_Status Master_TxLBT_SameChannel(const uint8_t *tx_buf,
            /* Non-CCA failure (SPI / HW) - retry won't help */
            return st;
        }
+       MASTER_LOG("[MASTER] lbt_retry ch=%u attempt=%u/%u\r\n",
+           g_active_channel, attempt + 1U, MASTER_SAME_CH_RETRIES);
        /* Pseudo-random back-off: mix seq counter with attempt index to
         * de-correlate colliding Masters. Bounded: [MASTER_SAME_CH_BACKOFF_MS
         * .. MASTER_SAME_CH_BACKOFF_MS + 7]. */
        uint32_t jitter = ((uint32_t)g_seq + attempt) & 0x07U;
        HAL_Delay(MASTER_SAME_CH_BACKOFF_MS + jitter);
    }
+   MASTER_LOG("[MASTER] lbt_fail ch=%u all %u retries failed\r\n",
+       g_active_channel, MASTER_SAME_CH_RETRIES);
    return st;   /* CC1101_ERR_CCA */
 }
 
@@ -690,6 +700,10 @@ static int Master_WakeUpImplant(void)
    if (st != CC2500_OK) {
        return -3;
    }
+   MASTER_LOG("[MASTER] beacon_tx ch=%u sess=%u dev=%02X%02X%02X%02X mid=%02X%02X%02X%02X\r\n",
+       g_active_channel, proposed_sess,
+       g_target_id[0], g_target_id[1], g_target_id[2], g_target_id[3],
+       g_master_id[0], g_master_id[1], g_master_id[2], g_master_id[3]);
 
    /* 5) Wait for wake-up ACK on the same channel */
    st = CC2500_WaitAndReadPacket(&g_cc2500,
@@ -743,6 +757,12 @@ static int Master_WakeUpImplant(void)
    /* 7) Session established */
    g_session_id = proposed_sess;
    g_last_rx_seq_valid = false;
+   MASTER_LOG("[MASTER] beacon_ack_ok sess=%u ch=%u dev=%02X%02X%02X%02X\r\n",
+       g_session_id, g_active_channel,
+       ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET],
+       ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 1U],
+       ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 2U],
+       ack_pkt.payload[PROTO_BEACON_DEVID_OFFSET + 3U]);
    return 0;
 }
 
@@ -791,6 +811,9 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
    if (st != CC1101_OK) {
        return -2;
    }
+   MASTER_LOG("[MASTER] poll_req_tx seq=%u sess=%u nonce=%02X%02X%02X%02X\r\n",
+       poll_pkt.seq, g_session_id,
+       g_poll_nonce[0], g_poll_nonce[1], g_poll_nonce[2], g_poll_nonce[3]);
 
    /* Wait for response on the same channel */
    st = CC1101_WaitAndReadPacket(&g_cc1101,
@@ -846,18 +869,22 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
        return -10;
    }
    if (ftype == MICS_FCF_TYPE_DATA && !Master_VerifyPollDataAuth(&resp_pkt, body_off)) {
+       MASTER_LOG("[MASTER] poll_resp_auth_fail seq=%u\r\n", resp_pkt.seq);
        return -11;
    }
-   if ((resp_buf != NULL) && (resp_len != NULL)) {
+   {
        uint8_t data_off = body_off;
        if (ftype == MICS_FCF_TYPE_DATA) {
            data_off = (uint8_t)(data_off + AUTH_ARG_LEN);
        }
        uint8_t n = (uint8_t)(resp_pkt.payload_len - data_off);
-       memcpy(resp_buf, &resp_pkt.payload[data_off], n);
-       *resp_len = n;
+       if ((resp_buf != NULL) && (resp_len != NULL)) {
+           memcpy(resp_buf, &resp_pkt.payload[data_off], n);
+           *resp_len = n;
+       }
+       MASTER_LOG("[MASTER] poll_resp_ok seq=%u dtype=%02X len=%u\r\n",
+           resp_pkt.seq, resp_pkt.payload[data_off], n);
    }
-
    return 0;
 }
 
@@ -898,6 +925,8 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
    if (st != CC1101_OK) {
        return -3;
    }
+   MASTER_LOG("[MASTER] data_write_tx seq=%u sess=%u len=%u\r\n",
+       write_pkt.seq, g_session_id, len);
 
    /* Wait for DATA_ACK */
    st = CC1101_WaitAndReadPacket(&g_cc1101,
@@ -940,9 +969,11 @@ static int Master_WriteToImplant(const uint8_t *data, uint8_t len)
        return -11;
    }
    if (ack_pkt.payload[PROTO_CMD_ARGS_OFFSET] != PROTO_STATUS_OK) {
+       MASTER_LOG("[MASTER] data_ack_fail status=%02X\r\n",
+           ack_pkt.payload[PROTO_CMD_ARGS_OFFSET]);
        return -12;
    }
-
+   MASTER_LOG("[MASTER] data_ack_ok seq=%u\r\n", ack_pkt.seq);
    return 0;
 }
 
@@ -1077,6 +1108,7 @@ static int Master_SendSleepCommand(void)
    if (st != CC1101_OK) {
        return -2;
    }
+   MASTER_LOG("[MASTER] sleep_cmd_tx sess=%u\r\n", g_session_id);
 
    /* Optionally wait for SLEEP_ACK */
    st = CC1101_WaitAndReadPacket(&g_cc1101,
@@ -1132,6 +1164,8 @@ static int Master_CommunicationSession(void)
             * pick a different channel. Slave will session-timeout or be
             * re-woken with the new channel. */
            g_session_id = PROTO_SESS_UNASSIGNED;
+           MASTER_LOG("[MASTER] session_restart attempt=%u/%u (lbt_cca_fail)\r\n",
+               attempt + 1U, MASTER_SESSION_RESTARTS);
            continue;
        }
        if (rc != 0) {
