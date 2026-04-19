@@ -877,17 +877,24 @@ static int Master_PollImplantData(uint8_t *resp_buf, uint8_t *resp_len)
        MASTER_LOG("[MASTER] poll_resp_auth_fail seq=%u\r\n", (unsigned)resp_pkt.seq);
        return -11;
    }
+   uint8_t data_off = body_off;
+   if (ftype == MICS_FCF_TYPE_DATA) {
+       data_off = (uint8_t)(data_off + AUTH_ARG_LEN);
+   }
+   uint8_t n = (uint8_t)(resp_pkt.payload_len - data_off);
+   uint8_t dtype = 0xFFU; /* sentinel for empty body */
+   if (n > 0U) {
+       dtype = resp_pkt.payload[data_off];
+   }
+
    MASTER_LOG("[MASTER] poll_resp_ok seq=%u dtype=%02X len=%u\r\n",
               (unsigned)resp_pkt.seq,
-              (unsigned)resp_pkt.payload[0],
-              (unsigned)resp_pkt.payload_len);
+              (unsigned)dtype,
+              (unsigned)n);
    if ((resp_buf != NULL) && (resp_len != NULL)) {
-       uint8_t data_off = body_off;
-       if (ftype == MICS_FCF_TYPE_DATA) {
-           data_off = (uint8_t)(data_off + AUTH_ARG_LEN);
+       if (n > 0U) {
+           memcpy(resp_buf, &resp_pkt.payload[data_off], n);
        }
-       uint8_t n = (uint8_t)(resp_pkt.payload_len - data_off);
-       memcpy(resp_buf, &resp_pkt.payload[data_off], n);
        *resp_len = n;
    }
 
